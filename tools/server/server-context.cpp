@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-ctx-tiers.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -931,6 +932,11 @@ private:
 
     bool sleeping = false;
 
+    // dynamic context sizing (params_base.ctx_dynamic)
+    std::vector<int32_t> ctx_tiers;          // computed once after first load
+    int32_t              ctx_cap = 0;        // effective max context (--ctx-size resolved)
+    int32_t              ctx_current_tier = 0; // current allocated tier
+
     void destroy() {
         spec.reset();
         ctx_dft.reset();
@@ -957,6 +963,28 @@ private:
             }
         }
         sleeping = new_state;
+    }
+
+    // Reallocate the context (and re-fit layer placement) to `new_tier`.
+    // MUST be called from the main loop thread with no generation in flight.
+    // Reuses the sleep/wake reload path: destroy() then load_model() with an
+    // explicit n_ctx, which makes common_fit_params re-fit the layer split for
+    // the new tier. load_model() rebuilds slots at the new size (KV is reset).
+    // Returns true if a resize happened.
+    bool resize_context(int32_t new_tier) {
+        if (!params_base.ctx_dynamic || new_tier == ctx_current_tier) {
+            return false;
+        }
+        SRV_INF("resizing context tier %d -> %d\n", ctx_current_tier, new_tier);
+        callback_state(SERVER_STATE_LOADING, {{"reason", "ctx_resize"}});
+
+        destroy();
+        params_base.n_ctx = new_tier;
+        if (!load_model(params_base)) {
+            GGML_ABORT("failed to reload model after context resize");
+        }
+        callback_state(SERVER_STATE_READY, {});
+        return true;
     }
 
     struct load_progress_data {
@@ -1165,6 +1193,15 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
+
+        if (params_base.ctx_dynamic && ctx_tiers.empty()) {
+            // first load: --ctx-size is the cap; remember it and build the tier list
+            ctx_cap   = params_base.n_ctx_orig > 0 ? params_base.n_ctx_orig : n_ctx;
+            ctx_tiers = server_ctx_build_tiers(params_base.ctx_dynamic_min, ctx_cap);
+        }
+        if (params_base.ctx_dynamic) {
+            ctx_current_tier = n_ctx;
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -3952,6 +3989,14 @@ server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
 
 bool server_context::load_model(common_params & params) {
+    if (params.ctx_dynamic && params.n_ctx_orig == 0) {
+        // remember the user's --ctx-size as the cap (validation guarantees n_ctx > 0 here),
+        // then start small so we only allocate the smallest tier up front
+        params.n_ctx_orig = params.n_ctx;
+        if (params.n_ctx > params.ctx_dynamic_min) {
+            params.n_ctx = params.ctx_dynamic_min;
+        }
+    }
     return impl->load_model(params);
 }
 
