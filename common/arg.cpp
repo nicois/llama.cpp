@@ -601,6 +601,19 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     }
 
+    if (ctx_arg.ex == LLAMA_EXAMPLE_SERVER && params.ctx_dynamic) {
+        if (params.n_parallel > 1) {
+            throw std::invalid_argument("--ctx-dynamic requires a single slot (set --parallel 1)");
+        }
+        if (params.n_ctx == 0) {
+            throw std::invalid_argument("--ctx-dynamic requires an explicit --ctx-size (the maximum tier)");
+        }
+        if (params.n_ctx <= params.ctx_dynamic_min) {
+            LOG_WRN("%s: --ctx-size (%d) <= --ctx-dynamic-min (%d); ctx-dynamic has no effect\n",
+                    __func__, params.n_ctx, params.ctx_dynamic_min);
+        }
+    }
+
     if (params.escape) {
         string_process_escapes(params.prompt);
         string_process_escapes(params.input_prefix);
@@ -3229,6 +3242,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value: cannot be 0 or less than -1");
             }
             params.sleep_idle_seconds = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-dynamic"},
+        string_format("enable on-demand context sizing in power-of-two tiers from --ctx-dynamic-min up to --ctx-size "
+                      "(server only, requires a single slot; default: %s)",
+                      params.ctx_dynamic ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.ctx_dynamic = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-dynamic-min"}, "N",
+        string_format("smallest context tier used when --ctx-dynamic is enabled (default: %d)", params.ctx_dynamic_min),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--ctx-dynamic-min must be positive");
+            }
+            params.ctx_dynamic_min = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
