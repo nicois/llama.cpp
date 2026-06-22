@@ -987,6 +987,62 @@ private:
         return true;
     }
 
+    // true if a larger context tier exists than the one currently allocated
+    bool ctx_can_grow() const {
+        if (!params_base.ctx_dynamic || mctx != nullptr || ctx_tiers.empty()) {
+            return false; // disabled, multimodal (unsupported), or no tiers
+        }
+        return ctx_tiers.back() > ctx_current_tier;
+    }
+
+    // Grow the context one tier and resume the in-flight generation transparently.
+    // Single-slot only. Snapshots the slot's tokens (prompt + generated-so-far),
+    // reloads at the next tier (rebuilding slots + KV), then relaunches the SAME
+    // task id with the snapshot as its prompt so the open response stream resumes.
+    // The already-streamed tokens become prompt (reprocessed, not re-sent).
+    // Compromise: sampler state is reseeded and a stop-string straddling the
+    // boundary may be missed (documented limitation).
+    void grow_midstream() {
+        GGML_ASSERT(slots.size() == 1);
+        server_slot & slot = slots[0];
+
+        int32_t next_tier = ctx_current_tier;
+        for (int32_t t : ctx_tiers) {
+            if (t > ctx_current_tier) { next_tier = t; break; }
+        }
+        if (next_tier == ctx_current_tier) {
+            return; // already at max tier; caller should not have called us
+        }
+
+        // snapshot what we need to resume before the reload wipes the slot
+        const llama_tokens snapshot = slot.prompt.tokens.get_tokens(); // copy
+        const int     id_task   = slot.task->id;
+        const size_t  index     = slot.task->index;
+        task_params   tparams   = slot.task->params;      // copy
+        const int32_t n_decoded = slot.n_decoded;
+
+        // continue the remaining generation budget (already-generated tokens
+        // were streamed to the client and are now part of the prompt)
+        if (tparams.n_predict > 0) {
+            tparams.n_predict = std::max(1, tparams.n_predict - n_decoded);
+        }
+
+        SRV_INF("growing context mid-stream: tier %d -> %d, reprocessing %zu tokens\n",
+                ctx_current_tier, next_tier, snapshot.size());
+
+        resize_context(next_tier); // rebuilds slots[0] as a pristine slot
+
+        server_task task(SERVER_TASK_TYPE_COMPLETION);
+        task.id     = id_task;   // preserve the open response channel
+        task.index  = index;
+        task.params = tparams;
+        task.tokens = server_tokens(snapshot, false);
+
+        if (!launch_slot_with_task(slots[0], std::move(task))) {
+            SRV_ERR("%s", "failed to relaunch slot after mid-stream grow\n");
+        }
+    }
+
     struct load_progress_data {
         server_context_impl * ctx;
         std::string stage;
@@ -1921,12 +1977,18 @@ private:
 
         // if context shifting is disabled, make sure that we don't run out of context
         if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
-            slot.truncated      = true;
-            slot.stop           = STOP_TYPE_LIMIT;
-            slot.has_next_token = false;
+            if (ctx_can_grow()) {
+                // do not stop: the next update_slots iteration will grow the
+                // context and resume generation from the current tokens
+                SLT_INF(slot, "%s", "context full, will grow to next tier\n");
+            } else {
+                slot.truncated      = true;
+                slot.stop           = STOP_TYPE_LIMIT;
+                slot.has_next_token = false;
 
-            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_decoded = %d, n_ctx = %d\n",
-                    slot.prompt.n_tokens(), slot.task->n_tokens(), slot.n_decoded, slot.n_ctx);
+                SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_decoded = %d, n_ctx = %d\n",
+                        slot.prompt.n_tokens(), slot.task->n_tokens(), slot.n_decoded, slot.n_ctx);
+            }
         }
 
         // check the limits
@@ -2802,6 +2864,17 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // dynamic context: if the in-flight generation has filled the context and
+        // a larger tier exists, grow and resume before building the next batch
+        if (params_base.ctx_dynamic && !slots.empty()) {
+            server_slot & slot = slots[0];
+            if (slot.state == SLOT_STATE_GENERATING &&
+                slot.prompt.n_tokens() + 1 >= slot.n_ctx &&
+                ctx_can_grow()) {
+                grow_midstream();
+            }
+        }
 
         // check if all slots are idle
         {
