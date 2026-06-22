@@ -1022,9 +1022,13 @@ private:
         const int32_t n_decoded = slot.n_decoded;
 
         // continue the remaining generation budget (already-generated tokens
-        // were streamed to the client and are now part of the prompt)
+        // were streamed to the client and are now part of the prompt). n_decoded
+        // resets to 0 on relaunch, so bake the remaining budget into the per-request
+        // n_predict - covering both the per-request and global --n-predict caps.
         if (tparams.n_predict > 0) {
             tparams.n_predict = std::max(1, tparams.n_predict - n_decoded);
+        } else if (tparams.n_predict == -1 && params_base.n_predict > 0) {
+            tparams.n_predict = std::max(1, params_base.n_predict - n_decoded);
         }
 
         SRV_INF("growing context mid-stream: tier %d -> %d, reprocessing %zu tokens\n",
@@ -2460,26 +2464,6 @@ private:
 
                     const int id_task = task.id;
 
-                    // dynamic context sizing: pick the tier that fits this request
-                    // before acquiring a slot (resize rebuilds slots + KV)
-                    if (params_base.ctx_dynamic && !ctx_tiers.empty() &&
-                        (task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL)) {
-                        const int32_t n_prompt = task.n_tokens();
-                        const int32_t n_pred   = task.params.n_predict > 0 ? task.params.n_predict : 0;
-                        const int32_t needed   = std::min(ctx_cap, n_prompt + n_pred + 4); // +4 safety margin
-
-                        int32_t target;
-                        const int32_t req_tier = server_ctx_required_tier(ctx_tiers, needed);
-                        if (req_tier > ctx_current_tier) {
-                            target = req_tier; // grow
-                        } else {
-                            target = server_ctx_shrink_target(ctx_tiers, ctx_current_tier, needed, 15); // shrink w/ hysteresis
-                        }
-                        if (target != ctx_current_tier) {
-                            resize_context(target);
-                        }
-                    }
-
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -2498,6 +2482,29 @@ private:
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
+                    }
+
+                    // dynamic context sizing: now that a slot is confirmed free (no
+                    // generation in flight), resize to the tier that fits this request.
+                    // resize_context rebuilds the slots vector, so re-acquire the slot.
+                    if (params_base.ctx_dynamic && !ctx_tiers.empty() && !task.is_parent() &&
+                        (task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL)) {
+                        const int32_t n_prompt = task.n_tokens();
+                        const int32_t n_pred   = task.params.n_predict > 0 ? task.params.n_predict : 0;
+                        const int32_t needed   = std::min(ctx_cap, n_prompt + n_pred + 4); // +4 safety margin
+
+                        int32_t target;
+                        const int32_t req_tier = server_ctx_required_tier(ctx_tiers, needed);
+                        if (req_tier > ctx_current_tier) {
+                            target = req_tier; // grow
+                        } else {
+                            target = server_ctx_shrink_target(ctx_tiers, ctx_current_tier, needed, 15); // shrink w/ hysteresis
+                        }
+                        if (target != ctx_current_tier) {
+                            resize_context(target);
+                            slot = get_available_slot(task); // slots vector was rebuilt
+                            GGML_ASSERT(slot != nullptr && !slot->is_processing());
+                        }
                     }
 
                     if (task.is_parent()) {
