@@ -2398,6 +2398,26 @@ private:
 
                     const int id_task = task.id;
 
+                    // dynamic context sizing: pick the tier that fits this request
+                    // before acquiring a slot (resize rebuilds slots + KV)
+                    if (params_base.ctx_dynamic && !ctx_tiers.empty() &&
+                        (task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL)) {
+                        const int32_t n_prompt = task.n_tokens();
+                        const int32_t n_pred   = task.params.n_predict > 0 ? task.params.n_predict : 0;
+                        const int32_t needed   = std::min(ctx_cap, n_prompt + n_pred + 4); // +4 safety margin
+
+                        int32_t target;
+                        const int32_t req_tier = server_ctx_required_tier(ctx_tiers, needed);
+                        if (req_tier > ctx_current_tier) {
+                            target = req_tier; // grow
+                        } else {
+                            target = server_ctx_shrink_target(ctx_tiers, ctx_current_tier, needed, 15); // shrink w/ hysteresis
+                        }
+                        if (target != ctx_current_tier) {
+                            resize_context(target);
+                        }
+                    }
+
                     server_slot * slot = get_available_slot(task);
 
                     //

@@ -67,6 +67,8 @@ class ServerProcess:
     n_batch: int | None = None
     n_ubatch: int | None = None
     n_ctx: int | None = None
+    ctx_dynamic: bool | None = False
+    ctx_dynamic_min: int | None = None
     n_ga: int | None = None
     n_ga_w: int | None = None
     n_predict: int | None = None
@@ -196,6 +198,10 @@ class ServerProcess:
             server_args.extend(["--tags", self.model_tags])
         if self.n_ctx:
             server_args.extend(["--ctx-size", self.n_ctx])
+        if self.ctx_dynamic:
+            server_args.append("--ctx-dynamic")
+        if self.ctx_dynamic_min is not None:
+            server_args.extend(["--ctx-dynamic-min", self.ctx_dynamic_min])
         if self.n_slots:
             server_args.extend(["--parallel", self.n_slots])
         if self.ctk:
