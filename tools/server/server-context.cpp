@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-ctx-tiers.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -931,6 +932,11 @@ private:
 
     bool sleeping = false;
 
+    // dynamic context sizing (params_base.ctx_dynamic)
+    std::vector<int32_t> ctx_tiers;          // computed once after first load
+    int32_t              ctx_cap = 0;        // effective max context (--ctx-size resolved)
+    int32_t              ctx_current_tier = 0; // current allocated tier
+
     void destroy() {
         spec.reset();
         ctx_dft.reset();
@@ -957,6 +963,88 @@ private:
             }
         }
         sleeping = new_state;
+    }
+
+    // Reallocate the context (and re-fit layer placement) to `new_tier`.
+    // MUST be called from the main loop thread with no generation in flight.
+    // Reuses the sleep/wake reload path: destroy() then load_model() with an
+    // explicit n_ctx, which makes common_fit_params re-fit the layer split for
+    // the new tier. load_model() rebuilds slots at the new size (KV is reset).
+    // Returns true if a resize happened.
+    bool resize_context(int32_t new_tier) {
+        if (!params_base.ctx_dynamic || new_tier == ctx_current_tier) {
+            return false;
+        }
+        SRV_INF("resizing context tier %d -> %d\n", ctx_current_tier, new_tier);
+        callback_state(SERVER_STATE_LOADING, {{"reason", "ctx_resize"}});
+
+        destroy();
+        params_base.n_ctx = new_tier;
+        if (!load_model(params_base)) {
+            GGML_ABORT("failed to reload model after context resize");
+        }
+        callback_state(SERVER_STATE_READY, {});
+        return true;
+    }
+
+    // true if a larger context tier exists than the one currently allocated
+    bool ctx_can_grow() const {
+        if (!params_base.ctx_dynamic || mctx != nullptr || ctx_tiers.empty()) {
+            return false; // disabled, multimodal (unsupported), or no tiers
+        }
+        return ctx_tiers.back() > ctx_current_tier;
+    }
+
+    // Grow the context one tier and resume the in-flight generation transparently.
+    // Single-slot only. Snapshots the slot's tokens (prompt + generated-so-far),
+    // reloads at the next tier (rebuilding slots + KV), then relaunches the SAME
+    // task id with the snapshot as its prompt so the open response stream resumes.
+    // The already-streamed tokens become prompt (reprocessed, not re-sent).
+    // Compromise: sampler state is reseeded and a stop-string straddling the
+    // boundary may be missed (documented limitation).
+    void grow_midstream() {
+        GGML_ASSERT(slots.size() == 1);
+        server_slot & slot = slots[0];
+
+        int32_t next_tier = ctx_current_tier;
+        for (int32_t t : ctx_tiers) {
+            if (t > ctx_current_tier) { next_tier = t; break; }
+        }
+        if (next_tier == ctx_current_tier) {
+            return; // already at max tier; caller should not have called us
+        }
+
+        // snapshot what we need to resume before the reload wipes the slot
+        const llama_tokens snapshot = slot.prompt.tokens.get_tokens(); // copy
+        const int     id_task   = slot.task->id;
+        const size_t  index     = slot.task->index;
+        task_params   tparams   = slot.task->params;      // copy
+        const int32_t n_decoded = slot.n_decoded;
+
+        // continue the remaining generation budget (already-generated tokens
+        // were streamed to the client and are now part of the prompt). n_decoded
+        // resets to 0 on relaunch, so bake the remaining budget into the per-request
+        // n_predict - covering both the per-request and global --n-predict caps.
+        if (tparams.n_predict > 0) {
+            tparams.n_predict = std::max(1, tparams.n_predict - n_decoded);
+        } else if (tparams.n_predict == -1 && params_base.n_predict > 0) {
+            tparams.n_predict = std::max(1, params_base.n_predict - n_decoded);
+        }
+
+        SRV_INF("growing context mid-stream: tier %d -> %d, reprocessing %zu tokens\n",
+                ctx_current_tier, next_tier, snapshot.size());
+
+        resize_context(next_tier); // rebuilds slots[0] as a pristine slot
+
+        server_task task(SERVER_TASK_TYPE_COMPLETION);
+        task.id     = id_task;   // preserve the open response channel
+        task.index  = index;
+        task.params = tparams;
+        task.tokens = server_tokens(snapshot, false);
+
+        if (!launch_slot_with_task(slots[0], std::move(task))) {
+            SRV_ERR("%s", "failed to relaunch slot after mid-stream grow\n");
+        }
     }
 
     struct load_progress_data {
@@ -1165,6 +1253,15 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
+
+        if (params_base.ctx_dynamic && ctx_tiers.empty()) {
+            // first load: --ctx-size is the cap; remember it and build the tier list
+            ctx_cap   = params_base.n_ctx_orig > 0 ? params_base.n_ctx_orig : n_ctx;
+            ctx_tiers = server_ctx_build_tiers(params_base.ctx_dynamic_min, ctx_cap);
+        }
+        if (params_base.ctx_dynamic) {
+            ctx_current_tier = n_ctx;
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -1884,12 +1981,18 @@ private:
 
         // if context shifting is disabled, make sure that we don't run out of context
         if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
-            slot.truncated      = true;
-            slot.stop           = STOP_TYPE_LIMIT;
-            slot.has_next_token = false;
+            if (ctx_can_grow()) {
+                // do not stop: the next update_slots iteration will grow the
+                // context and resume generation from the current tokens
+                SLT_INF(slot, "%s", "context full, will grow to next tier\n");
+            } else {
+                slot.truncated      = true;
+                slot.stop           = STOP_TYPE_LIMIT;
+                slot.has_next_token = false;
 
-            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_decoded = %d, n_ctx = %d\n",
-                    slot.prompt.n_tokens(), slot.task->n_tokens(), slot.n_decoded, slot.n_ctx);
+                SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_decoded = %d, n_ctx = %d\n",
+                        slot.prompt.n_tokens(), slot.task->n_tokens(), slot.n_decoded, slot.n_ctx);
+            }
         }
 
         // check the limits
@@ -2381,6 +2484,29 @@ private:
                         break;
                     }
 
+                    // dynamic context sizing: now that a slot is confirmed free (no
+                    // generation in flight), resize to the tier that fits this request.
+                    // resize_context rebuilds the slots vector, so re-acquire the slot.
+                    if (params_base.ctx_dynamic && !ctx_tiers.empty() && !task.is_parent() &&
+                        (task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL)) {
+                        const int32_t n_prompt = task.n_tokens();
+                        const int32_t n_pred   = task.params.n_predict > 0 ? task.params.n_predict : 0;
+                        const int32_t needed   = std::min(ctx_cap, n_prompt + n_pred + 4); // +4 safety margin
+
+                        int32_t target;
+                        const int32_t req_tier = server_ctx_required_tier(ctx_tiers, needed);
+                        if (req_tier > ctx_current_tier) {
+                            target = req_tier; // grow
+                        } else {
+                            target = server_ctx_shrink_target(ctx_tiers, ctx_current_tier, needed, 15); // shrink w/ hysteresis
+                        }
+                        if (target != ctx_current_tier) {
+                            resize_context(target);
+                            slot = get_available_slot(task); // slots vector was rebuilt
+                            GGML_ASSERT(slot != nullptr && !slot->is_processing());
+                        }
+                    }
+
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
@@ -2745,6 +2871,17 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // dynamic context: if the in-flight generation has filled the context and
+        // a larger tier exists, grow and resume before building the next batch
+        if (params_base.ctx_dynamic && !slots.empty()) {
+            server_slot & slot = slots[0];
+            if (slot.state == SLOT_STATE_GENERATING &&
+                slot.prompt.n_tokens() + 1 >= slot.n_ctx &&
+                ctx_can_grow()) {
+                grow_midstream();
+            }
+        }
 
         // check if all slots are idle
         {
@@ -3952,6 +4089,14 @@ server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
 
 bool server_context::load_model(common_params & params) {
+    if (params.ctx_dynamic && params.n_ctx_orig == 0) {
+        // remember the user's --ctx-size as the cap (validation guarantees n_ctx > 0 here),
+        // then start small so we only allocate the smallest tier up front
+        params.n_ctx_orig = params.n_ctx;
+        if (params.n_ctx > params.ctx_dynamic_min) {
+            params.n_ctx = params.ctx_dynamic_min;
+        }
+    }
     return impl->load_model(params);
 }
 

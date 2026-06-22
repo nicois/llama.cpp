@@ -313,6 +313,43 @@ services:
       LLAMA_ARG_PORT: 8080
 ```
 
+### Dynamic context sizing
+
+`--ctx-dynamic` makes the server allocate context on demand instead of reserving
+`--ctx-size` up front. This targets the single-client case, where reloading is
+cheap compared to permanently reserving a large context (and, on
+memory-constrained devices, to keeping model layers off the GPU to make room for
+an unused context).
+
+- `--ctx-dynamic` enables the feature. It requires a single slot (`--parallel 1`,
+  the default) and an explicit `--ctx-size` (the maximum, used as the cap).
+- `--ctx-dynamic-min N` sets the smallest tier (default: 32768).
+- Context sizes form power-of-two tiers from `--ctx-dynamic-min` up to
+  `--ctx-size`. The server starts at the smallest tier and resizes to the
+  smallest tier that fits each request. Shrinking uses hysteresis to avoid
+  resizing back and forth near a tier boundary.
+
+Each resize reloads the model and re-fits layer placement for the new tier, so on
+memory-constrained devices a smaller context lets more layers run on the GPU.
+Weights are re-read on every resize (warm from the OS page cache).
+
+If a streaming generation fills the context and a larger tier is available, the
+server grows mid-stream and resumes: the connection stays open and tokens simply
+pause while the context is reallocated and the existing tokens are reprocessed,
+then generation continues. There is no truncation and no need to restart the
+request. Once the maximum tier (`--ctx-size`) is reached, generation stops (or
+uses context shift if `--context-shift` is enabled), as it would without this
+feature.
+
+Limitations:
+- Multimodal models do not support mid-stream growth (resize at request arrival
+  still applies).
+- A mid-stream grow reseeds the sampler and reprocesses the existing tokens as a
+  new prompt, so the sampler's repetition history is reset at the boundary, a
+  stop string straddling the boundary may be missed, and the request's reported
+  `prompt_tokens` reflects the reprocessed token count rather than the original
+  prompt length.
+
 ### Multimodal support
 
 Multimodal support was added in [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) and is currently an experimental feature.
