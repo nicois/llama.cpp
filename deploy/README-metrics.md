@@ -92,4 +92,15 @@ un-pinned queries. Stale series age out of Mimir on their own (~5 min for `up`).
 - Spec-decode accept rate: `rate(llamacpp:draft_tokens_accepted_total[$__rate_interval]) / rate(llamacpp:draft_tokens_total[$__rate_interval])`
 - Context-shift rate: `rate(llamacpp:n_ctx_shift_total[$__rate_interval])`
 - Host CPU busy: hostmetrics emits `system_cpu_time_seconds_total` (counter),
-  memory `system_memory_usage_bytes`, load `system_cpu_load_average_1m`.
+  memory `system_memory_usage_bytes{state="used"}`, load `system_cpu_load_average_1m`.
+
+## Dashboard
+A ready-made dashboard is at `deploy/grafana/llama-server-rainbow.json`. Import
+it in Grafana (Dashboards → New → Import → Upload JSON), then pick the Prometheus
+(Mimir) data source; the `$host` and `$model` variables auto-populate from label
+values. Rows: **Memory & KV cache** (KV bytes vs free VRAM, live cache type),
+**GPU & host**, **Latency & distribution** (prompt/context/TTFT/gen quantiles),
+**Throughput & speculative decoding**. Latency/quantile panels read `NaN` while
+the server is idle (no `rate()` samples) — they fill in once requests flow.
+The palette is colorblind-safe (validated blue/orange/aqua); every multi-series
+panel carries a legend so identity is never color-alone.
