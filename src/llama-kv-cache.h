@@ -161,6 +161,9 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    size_t size_k_bytes() const;
+    size_t size_v_bytes() const;
+
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
@@ -296,8 +299,6 @@ private:
 
     size_t total_size() const;
 
-    size_t size_k_bytes() const;
-    size_t size_v_bytes() const;
     size_t size_k_idx_bytes() const;
 
     ggml_tensor * build_rope_shift(
