@@ -104,3 +104,20 @@ values. Rows: **Memory & KV cache** (KV bytes vs free VRAM, live cache type),
 the server is idle (no `rate()` samples) — they fill in once requests flow.
 The palette is colorblind-safe (validated blue/orange/aqua); every multi-series
 panel carries a legend so identity is never color-alone.
+
+### Multi-model view
+
+`deploy/grafana/llama-server-models.json` (uid `llama-models`) is a companion
+dashboard that shows **all models at once** instead of one selected `$model`.
+Import it the same way. It has no `$model` variable — every llama panel groups
+`by (model)` and uses Grafana's colorblind-safe `palette-classic`, so each model
+gets its own stable color and legend entry. A top **Ladder activity**
+state-timeline shows which model was the loaded child over the window (built from
+`present_over_time(llamacpp:kv_cache_k_bytes[5m])`), making client laddering
+visible at a glance. GPU & host panels stay host-level (VRAM, GPU, CPU are shared
+across whichever model is loaded).
+
+Use `llama-server-rainbow.json` to drill into a single model in full detail; use
+`llama-server-models.json` for the whole-ladder overview and per-model
+comparison. Same idle-state caveat applies: inactive models show gaps/NaN, and
+latency/throughput lines fill in only while a model is the loaded child.
