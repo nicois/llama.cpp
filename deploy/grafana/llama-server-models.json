@@ -45,7 +45,7 @@
       "id": 2,
       "type": "state-timeline",
       "title": "Model loaded (which model was emitting metrics)",
-      "description": "One band per model; a band is present only while that model was the loaded child emitting metrics. Gaps mean the model was not loaded. Reads ladder switches across the window at a glance.",
+      "description": "One band per model; a band is present only while that model was the loaded child emitting metrics. Gaps mean the model was not loaded. Reads ladder switches across the window at a glance. Bands overhang the true unload by up to 5m (the present_over_time lookback window).",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 7, "w": 24, "x": 0, "y": 1 },
       "fieldConfig": {
