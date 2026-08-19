@@ -225,14 +225,31 @@ Only the *free* path changes: `async_free` returns to a driver pool (retained), 
 it. So the peak must be budgeted either way; retention only decides whether it also permanently eats
 the margin.
 
+**The full-size staging copy is necessary for the current algorithm — do not try to chunk it.**
+The reorder is *in place* into a struct-of-arrays layout whose regions are sized by the total block
+count, so the permutation has long-range dependencies. For `block_q6_K` (210 B = `ql` 128 + `qh` 64 +
+`scales` 16 + `d` 2) over `N` blocks, block `ib` writes `ql` at `128·ib`, `qh` at `128N + 64·ib`,
+`scales` at `192N + 16·ib` and `dm` at `208N + 2·ib`, while source block `ib` sits at `210·ib`.
+Processing block 0 therefore writes into the source bytes of blocks `128N/210 ≈ 0.61N` and
+`208N/210 ≈ 0.99N`. Any naive chunking silently corrupts weights.
+
+Note also that allocation failure is **already handled gracefully** (`:3908`): it warns and returns
+false, and the reorder is skipped. So the memory is not optional-but-wasted — it is required for the
+optimisation, and the optimisation is already skippable.
+
 **Fix options**, cheapest first:
 
-1. **Reorder in chunks.** The scratch is a staging copy; slicing the tensor bounds it to a fixed
-   working-set instead of the largest tensor. Removes ~1 GiB of demand outright and needs no
-   accounting changes.
-2. **Allocate it through a `ggml_backend_buffer`** so it lands in `mb.model` and the fitter sees it.
-3. **At minimum**, add the peak to the fit budget the way the draft/MTP context already is
-   (`tools/server/server-context.cpp:1069`).
+1. **Account for it.** Allocate the scratch through a `ggml_backend_buffer` so it lands in `mb.model`,
+   or add the peak to the fit budget the way the draft/MTP context already is
+   (`tools/server/server-context.cpp:1069`). This fixes the reported problem — `--fit` over-committing
+   — without touching the reorder algorithm. Note the peak is a *transient* load-time spike, so a model
+   that "just fits" can fail during load even if steady-state would have been fine; and because
+   `async_free` returns to a driver pool rather than the OS, it also eats the margin thereafter.
+2. **Reorder on the host** during model load, before the weights are uploaded. Eliminates the device
+   scratch entirely rather than accounting for it. Larger change, and needs care not to regress load
+   time, but it is the only option that actually removes the ~1 GiB.
+3. **Out-of-place on device** — write the reordered layout into a second buffer and swap pointers.
+   Correct and simple, but still needs a full-size allocation, so it only helps if paired with (1).
 
 **Caveat if reproducing on an iGPU:** the breakdown's `unaccounted` column is meaningless on UMA
 hardware — `total`/`free` are *system* RAM, so `total - free - self` absorbs every other process
