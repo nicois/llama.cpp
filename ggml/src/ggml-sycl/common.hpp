@@ -26,6 +26,7 @@
 #include "type.hpp"
 #include "sycl_hw.hpp"
 #include "fattn-buffers.hpp"
+#include "memtrace.hpp"
 
 namespace syclexp = sycl::ext::oneapi::experimental;
 
@@ -331,7 +332,10 @@ struct ggml_tensor_extra_gpu {
 };
 
 extern int g_ggml_sycl_use_level_zero_api;
-void * ggml_sycl_malloc_device(size_t size, sycl::queue &q);
+// `site` only affects GGML_SYCL_MEMTRACE attribution; it has no effect on the
+// allocation itself. Pass the site when the caller is not a plain direct alloc.
+void * ggml_sycl_malloc_device(size_t size, sycl::queue &q,
+                               ggml_sycl_mem_site site = GGML_SYCL_MEM_DIRECT);
 void ggml_sycl_free_device(void *ptr, sycl::queue &q);
 
 void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams={});

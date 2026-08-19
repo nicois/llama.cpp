@@ -180,11 +180,15 @@ def cmd_compare(srv, args):
         results.append({"model": model, "load": {"ptok": 0, **at_load},
                         "rungs": rungs})
 
-    print(f"\n{'model':<26} {'kv':>9} {'used@deep':>10} {'ptok':>8}")
+    # With --depths '' this degenerates to a load-only sweep, which is what you
+    # want for reading load-time state (e.g. against shutdown memory breakdowns).
+    print(f"\n{'model':<30} {'cells':>8} {'kv':>9} {'used':>10} {'free':>10} "
+          f"{'ptok':>8}")
     for r in results:
-        last = r["rungs"][-1]
-        print(f"{r['model']:<26} {last['kv'] / MIB:9.1f} "
-              f"{last['used'] / MIB:10.1f} {str(last['ptok']):>8}")
+        last = r["rungs"][-1] if r["rungs"] else r["load"]
+        print(f"{r['model']:<30} {last['cells']:8.0f} {last['kv'] / MIB:9.1f} "
+              f"{last['used'] / MIB:10.1f} {last['free'] / MIB:10.1f} "
+              f"{str(last['ptok']):>8}")
     return results
 
 

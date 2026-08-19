@@ -921,7 +921,7 @@ ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
             return nullptr;
         }
     } else {
-        SYCL_CHECK(CHECK_TRY_ERROR(dev_ptr = (void *)ggml_sycl_malloc_device(size, *stream)));
+        SYCL_CHECK(CHECK_TRY_ERROR(dev_ptr = (void *)ggml_sycl_malloc_device(size, *stream, GGML_SYCL_MEM_BUFFER)));
         if (!dev_ptr) {
           GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device\n", __func__, size);
           return nullptr;
@@ -1167,7 +1167,7 @@ ggml_backend_sycl_split_buffer_init_tensor(ggml_backend_buffer_t buffer,
         ggml_sycl_set_device(i);
         const queue_ptr stream = ctx->streams[i];
         char * buf;
-        SYCL_CHECK(CHECK_TRY_ERROR(buf = (char *)ggml_sycl_malloc_device(size, *stream)));
+        SYCL_CHECK(CHECK_TRY_ERROR(buf = (char *)ggml_sycl_malloc_device(size, *stream, GGML_SYCL_MEM_BUFFER)));
         if (!buf) {
             char err_buf[1024];
             snprintf(err_buf, 1023, "%s: can't allocate %lu Bytes of memory on device\n", __func__, size);
@@ -1637,7 +1637,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         void * ptr;
         size_t look_ahead_size = (size_t) (1.05 * size);
 
-        SYCL_CHECK(CHECK_TRY_ERROR(ptr = (void *)ggml_sycl_malloc_device(look_ahead_size, *qptr)));
+        SYCL_CHECK(CHECK_TRY_ERROR(ptr = (void *)ggml_sycl_malloc_device(look_ahead_size, *qptr, GGML_SYCL_MEM_POOL_LEG)));
         if (!ptr) {
             GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device/GPU\n", __func__, look_ahead_size);
             return nullptr;
@@ -1751,6 +1751,7 @@ struct ggml_sycl_pool_vmm : public ggml_sycl_pool {
 
             // add to the pool
             pool_size += reserve_size;
+            ggml_sycl_memtrace_add(GGML_SYCL_MEM_POOL_VMM, map_ptr, reserve_size);
 
 #ifdef DEBUG_SYCL_MALLOC
             GGML_LOG_INFO("sycl pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
@@ -3834,7 +3835,9 @@ static inline void * sycl_ext_malloc_device(dpct::queue_ptr stream, size_t size)
     bool use_async = g_ggml_sycl_use_async_mem_op;
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
     if (use_async) {
-        return syclex::async_malloc(*stream, sycl::usm::alloc::device, size);
+        void * ptr = syclex::async_malloc(*stream, sycl::usm::alloc::device, size);
+        ggml_sycl_memtrace_add(GGML_SYCL_MEM_ASYNC, ptr, size);
+        return ptr;
     }
 #else
     // If async allocation extension is not available, use_async should always be false.
@@ -3847,6 +3850,7 @@ static inline void sycl_ext_free(dpct::queue_ptr stream, void * ptr) {
     bool use_async = g_ggml_sycl_use_async_mem_op;
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
     if (use_async) {
+        ggml_sycl_memtrace_del(ptr);
         syclex::async_free(*stream, ptr);
         return;
     }
@@ -5434,6 +5438,7 @@ void ggml_backend_sycl_get_device_memory(int device, size_t *free,
 
     SYCL_CHECK(CHECK_TRY_ERROR(
         dpct::dev_mgr::instance().get_device(device).get_memory_info(*free, *total)));
+    ggml_sycl_memtrace_report("device memory query");
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
