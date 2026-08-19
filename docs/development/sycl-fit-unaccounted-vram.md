@@ -16,8 +16,12 @@ fits in free device memory. The projection is `mb.total() = model + context + co
 (`src/llama-ext.h:72-74`, consumed at `common/fit.cpp:252`). On SYCL a large amount of device memory
 is allocated **outside** that accounting, so the fitter over-commits. The gap:
 
-- is **~1.2 GiB immediately at load**, roughly independent of KV cache type, and
-- **grows with context depth**, at **3.56 KiB/token with f16 KV and 7.64 KiB/token with q8_0 KV**.
+- has a **~450 MiB floor at load** (of which 126 MiB is the router process's own SYCL context),
+  independent of `n_ctx` and of KV cache type,
+- gains a **large-`n_ctx` term at load** — negligible at `n_ctx` 32768, but ~1200 MiB above the floor
+  at `n_ctx` 182016 (§3, Class C), and
+- **grows further with context depth**, at **3.56 KiB/token with f16 KV and 7.64 KiB/token with
+  q8_0 KV**.
 
 Because quantizing the KV cache frees budget that `--fit` immediately spends on a deeper context,
 *and* roughly doubles the per-token unaccounted cost, a quantized-KV configuration is materially more
@@ -152,16 +156,43 @@ materialised in every F16-requiring path). This needs the instrumentation in §4
 `pool_size`, retain their high-water mark for the process lifetime, and are reported nowhere.
 Class A flows through these, but so does every other op's scratch.
 
-### Class C — ~1.2 GiB fixed, present at load, unattributed
+### Class C — a ~450 MiB floor at load, plus a large-`n_ctx` term that turns on somewhere above 32768
 
-This is the **largest single chunk** and it is *not* flash-attention-related — it is already present
-before any prefill, and is nearly identical for f16 and q8_0. **`--fit-target 128` is unreachable
-until this is attributed.** Candidates, none yet confirmed:
+Measured at near-zero depth (one 4-token request, then swap out to flush the shutdown breakdown),
+same weights and `--ubatch-size 4096` throughout:
 
-- Level Zero context / module / kernel-binary residency for a large JIT'd backend
+| `n_ctx` | KV | `self` | unaccounted |
+|---|---|---|---|
+| 8192 (q4_0) | 144 MiB | 17462 | **462 MiB** |
+| 8192 (f16) | 512 MiB | 17829 | **513 MiB** |
+| 32768 (q8_0) | 1088 MiB | 18598 | **455 MiB** |
+| 32768 (mixed q4_0/f16) | 1312 MiB | 18822 / 18821 | **439 / 440 MiB** |
+| 32768 (mixed q8_0/f16) | 1568 MiB | 19078 / 19077 | **439 / 439 MiB** |
+| Qwen3.8-**2B**, `model = 1908` | 1651 MiB | 5960 | **361 MiB** |
+
+Two conclusions:
+
+- **The load-time floor is ~450 MiB and is independent of `n_ctx` and of KV cache type.** A 2B model
+  still carries 361 MiB despite 8.5× fewer weight bytes, so it is only weakly weight-dependent. Of
+  this, **126 MiB is the router process itself** — a llama.cpp process with SYCL initialised and *no*
+  model loaded occupies 126 MiB of device memory (32656 − 32530), which is device-wide and therefore
+  outside any child's accounting. Note this is automatically handled by the fitter, since it queries
+  free memory device-wide.
+- **There is no ~1.2 GiB fixed cost** (an earlier reading of this data was wrong). But `n_ctx = 182016`
+  showed **1660 MiB at load**, ~1200 MiB above the floor, so a term proportional to `n_ctx` exists and
+  is negligible at 32768 while dominant at 182016. A floor of ~250 MiB plus ~6.7 KiB/token is roughly
+  consistent with all three points (predicting 305 / 465 / 1470 against measured 490 / 445 / 1660) but
+  the fit is not good enough to trust. **The gap between 32768 and 182016 needs filling** — presets
+  pinned at `--ctx-size 65536` and `131072` would show whether it is linear or a step.
+
+Incidental regularity worth knowing: `mb.context` was **exactly `KV + 149 MiB`** in all seven 27B
+configurations, so `mb.context` itself is well-behaved and the KV cache accounting is sound.
+
+Remaining candidates for the floor, none yet confirmed:
+
+- Level Zero context / module / kernel-binary residency (bounded above by the 126 MiB router baseline)
 - `sycl_reorder_temp_buffer` and the quantized-weight reorder path (`ggml-sycl.cpp:3860-3895`);
-  buffers are transient but the peak may be retained by the pool
-- `--load-mode mlock` interaction
+  buffers are transient but the pool retains the peak — would explain the weak weight-dependence
 - driver-side allocation granularity / rounding over ~866 tensors
 
 ---
@@ -185,7 +216,10 @@ Ship the pool high-water as a gauge too — this deployment already scrapes `lla
 Mimir/Grafana, so exposing `pool_size` / high-water makes the whole class observable without a rebuild
 next time. Suggested: `llamacpp:sycl_pool_bytes`, `llamacpp:sycl_pool_peak_bytes`.
 
-**Exit criterion:** the ~1.2 GiB at load is attributed to named call sites, summing to within ~50 MiB.
+**Exit criterion:** both the ~450 MiB load-time floor and the large-`n_ctx` load-time term (§3,
+Class C) are attributed to named call sites, summing to within ~50 MiB. Cheap first step, no code
+needed: pin `--ctx-size` at 65536 and 131072 to establish whether the large-`n_ctx` term is linear or a
+step, since that determines whether Stage 2's reservation subsumes it.
 
 ### 4.2 Stage 2: reserve FA staging in the compute buffer (port the CUDA fix)
 

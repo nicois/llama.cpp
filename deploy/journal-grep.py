@@ -160,8 +160,9 @@ class Handler(BaseHTTPRequestHandler):
         except re.error as e:
             return self._send(400, f"bad regex: {e}\n")
 
+        shown = sum(1 for line in out if line != "--")
         header = (f"# {hits} matching lines, {total} lines with context, "
-                  f"showing {len(out)} (scanned {len(rx_lines)})\n")
+                  f"showing {shown} (scanned {len(rx_lines)})\n")
         return self._send(200, header + "\n".join(out) + ("\n" if out else ""))
 
 
