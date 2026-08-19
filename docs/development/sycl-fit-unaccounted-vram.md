@@ -16,12 +16,13 @@ fits in free device memory. The projection is `mb.total() = model + context + co
 (`src/llama-ext.h:72-74`, consumed at `common/fit.cpp:252`). On SYCL a large amount of device memory
 is allocated **outside** that accounting, so the fitter over-commits. The gap:
 
-- has a **~450 MiB floor at load** (of which 126 MiB is the router process's own SYCL context),
-  independent of `n_ctx` and of KV cache type,
-- gains a **large-`n_ctx` term at load** — negligible at `n_ctx` 32768, but ~1200 MiB above the floor
-  at `n_ctx` 182016 (§3, Class C), and
+- is **flat in `n_ctx`** — ~1561 MiB at load for the 27B at any context from 65536 to 262144
+  (§2.5). **64 % of this is now identified**: the weight-reorder scratch, a whole-tensor staging buffer
+  sized by `output.weight`, confirmed causally and to the MiB (§2.6),
 - **grows further with context depth**, at **3.56 KiB/token with f16 KV and 7.64 KiB/token with
-  q8_0 KV**.
+  q8_0 KV**, and
+- **roughly doubles with MTP** (`--spec-type draft-mtp`), which adds +1484 to +2252 MiB *beyond* the
+  weights and context it does account for — the single largest contributor.
 
 Because quantizing the KV cache frees budget that `--fit` immediately spends on a deeper context,
 *and* roughly doubles the per-token unaccounted cost, a quantized-KV configuration is materially more
@@ -108,9 +109,134 @@ common_params_fit_impl: cannot meet free memory target of 2160 MiB, need to redu
 common_params_fit_impl: will leave 4210 >= 2160 MiB of free device memory, no changes needed
 ```
 
-`--fit-target 1024` became an effective 2160 MiB. Even so, 2160 MiB < the 2265–3562 MiB that goes
-unaccounted. **The safety margin is smaller than the error it exists to absorb.** Any work here should
-first establish what transforms 1024 → 2160, so that a `--fit-target 128` request means 128 MiB.
+`--fit-target 1024` became an effective 2160 MiB. **This is deliberate, not a bug**:
+`tools/server/server-context.cpp:1069` does `params_base.fit_params_target[i] += bytes`, adding the
+draft/MTP context's measured `context + compute` to the margin so the second context has room. So the
+MTP configurations reserve ~1136 MiB extra by design.
+
+Even so, 2160 MiB < the 2265–3562 MiB that goes unaccounted. **The safety margin is smaller than the
+error it exists to absorb.** Note the consequence for the goal: because the margin is a floor plus
+reservations, a `--fit-target 128` request will not mean 128 MiB of free memory unless the reserved
+terms are themselves accurate.
+
+### 2.5 The accounting model
+
+Sweep over `n_ctx` with weights, `--batch-size 8192` and `--ubatch-size 4096` held constant, MTP as a
+controlled variable, `--fit off` on the pinned presets, measured at near-zero depth. Both models are
+**dense** (`n_expert = 0`): 27B is `n_vocab 248320, n_embd 5120, n_ff 17408, n_layer 64`; 2B is
+`n_embd 2048, n_ff 6144, n_layer 24`.
+
+| config | n_ctx | KV | model | context | compute | `self` | **unacc** |
+|---|---|---|---|---|---|---|---|
+| 27B f16 | 65536 | 4096 | 16128 | 4245 | 1488 | 21861 | **1561** |
+| 27B f16 + MTP | 65536 | 4096 | 16400 | 4694 | 1488 | 22583 | **3045** |
+| 27B f16 | 131072 | 8192 | 16128 | 8341 | 2000 | 26469 | **1561** |
+| 27B f16 + MTP | 131072 | 8192 | 16400 | 8790 | 2000 | 27191 | **3813** |
+| 27B f16 (fitted) | 182016 | 11376 | 16128 | 11525 | 2398 | 30051 | **1659** |
+| 27B f16 + MTP (fitted) | 115200 | 7200 | 16400 | 7798 | 1876 | 26075 | **5349** |
+| 27B q8_0 (fitted) | 262144 | 8704 | 16128 | 8853 | 3024 | 28006 | **1690** |
+| 27B q8_0 + MTP (fitted) | 197632 | 6562 | 16400 | 7160 | 2520 | 26081 | **5384** |
+| 2B q8_0 (fitted) | 262144 | 1632 | 1908 | 1651 | 2400 | 5960 | **332** |
+
+**Three of the four terms are exactly predictable:**
+
+- `model` — weights on device. MTP adds exactly **+272 MiB**.
+- `context` = `KV + 149 MiB` (27B), `KV + 598 MiB` (27B + MTP), `KV + 19 MiB` (2B). Constant per
+  configuration, so **KV cache accounting is sound**.
+- `compute` = `base + ubatch × n_ctx × 2 bytes`, with `base` = 976 MiB (27B), 352 MiB (2B). Exact to
+  the MiB at every context size — 1488 / 2000 / 2398 / 3024 for 65536 / 131072 / 182016 / 262144.
+  The `ubatch × n_ctx × 2` term is the F16 KQ mask, and it is why `--ubatch-size 4096` is expensive at
+  long context: 2048 MiB of mask at `n_ctx` 262144.
+
+**`unaccounted` is the only unexplained term, and it is flat in `n_ctx`:** 1561 MiB at both 65536 and
+131072 — a 2× context change with no movement — and only 1659/1690 at 182016/262144. It is therefore
+**not** the flash-attention staging, which would scale with `n_kv`. It scales sub-linearly with model
+size (1561 vs 332 MiB for 8.45× the weight bytes, a ratio of 4.70).
+
+**MTP is the single largest unaccounted contributor**: +1484 MiB at `n_ctx` 65536 and +2252 MiB at
+131072 on top of the base term, over and above the +272 MiB of weights and +449 MiB of context that
+*are* accounted. The two fitted MTP configurations show +3690/+3694 MiB, which does not fit a
+monotonic relationship with `n_ctx` (5349 MiB at 115200 vs 3813 MiB at 131072) and is unexplained.
+
+Candidate mechanism for the base term, **not confirmed**: `sycl_reorder_temp_buffer`
+(`ggml-sycl.cpp:3864`) allocates a whole-tensor scratch through `sycl_ext_malloc_device`, which uses
+`syclex::async_malloc`; the matching `async_free` returns memory to a **driver pool rather than the
+OS**, so the peak stays resident and invisible. The arithmetic does not support it on its own, though:
+the largest reordered tensor is the `output`/`lm_head` at 682 MiB (Q4_K) to 1288 MiB (Q8_0) for the
+27B and 273–515 MiB for the 2B, i.e. a predicted ratio of 2.5 against a measured 4.70. So either an
+additional mechanism is involved or the pool rounds. Two zero-code tests bisect it, both requiring
+only a container restart:
+
+```sh
+GGML_SYCL_ENABLE_OPT=0          # skip the weight reorder entirely (slower)
+GGML_SYCL_USE_ASYNC_MEM_OP=0    # use real malloc/free instead of the driver pool
+```
+
+If either collapses `unaccounted` from ~1561 MiB toward the ~450 MiB floor, the reorder path is
+implicated. Otherwise use `GGML_SYCL_MEMTRACE=1` (§4.1), which attributes it directly.
+
+### 2.6 Root cause of the load-time term: the weight-reorder scratch
+
+Found by running the instrumentation of §4.1 on a **Meteor Lake iGPU** (Xe-LPG, `i915`), chosen
+because oneDNN flash-attention is Battlemage-only (`fattn-onednn.cpp:29`) and is therefore *disabled*
+there — so anything that still appears cannot be oneDNN.
+
+`GGML_SYCL_MEMTRACE=1`, `Qwen3.8-27B-UD-Q2_K_XL`, `--ctx-size 8192 --ubatch-size 512`:
+
+```
+buffer   peak 10359 MiB      <- vs breakdown self 10359 (9567 + 661 + 130). Exact.
+async    peak   520 MiB      <- the reorder scratch
+pool_vmm peak     2 MiB
+fattn_kv          never allocated
+```
+
+`buffer` reconciles with llama.cpp's own `self` to within 1 MiB, which validates the hooks. And the
+A/B is causal:
+
+| | reorder on | `GGML_SYCL_ENABLE_OPT=0` |
+|---|---|---|
+| `buffer` peak | 10359 MiB | 10359 MiB |
+| `async` peak | **520 MiB** | **never allocated** |
+| unaccounted | **522 MiB** | **0 MiB** |
+
+**The mechanism.** `reorder_qw_*` allocates a scratch buffer the size of the *whole tensor*
+(`sycl_reorder_temp_buffer`, `ggml-sycl.cpp:3864`) via `sycl_ext_malloc_device`. Peak demand is
+therefore the largest reordered tensor — in practice `output.weight` — and it is invisible to the
+memory breakdown. The sizes match analytically, not approximately:
+
+| model | measured `async` peak | `output.weight` = `n_vocab × n_embd` at… |
+|---|---|---|
+| 27B UD-Q2_K_XL | 520 MiB | **521 MiB** at Q3_K |
+| 27B UD-Q4_K_XL | 994 MiB | **995 MiB** at Q6_K |
+
+(1.271 G elements for `248320 × 5120`; unsloth's `UD-*_XL` mixes keep `output.weight` at a higher bpw
+than the name suggests, which is why the earlier largest-tensor estimate assuming a uniform quant was
+wrong.)
+
+This explains the **flat-in-`n_ctx`** signature in §2.5: a per-largest-tensor scratch has no `n_ctx`
+dependence. For the 27B UD-Q4_K_XL it accounts for **994 of the 1561 MiB** the B70 shows at load
+(64 %). The residual ~567 MiB is most likely oneDNN plus pool growth under real compute — this run did
+2 tokens at `ubatch 512`, versus the B70's `ubatch 4096` with oneDNN active. Running memtrace on the
+B70 will attribute the remainder exactly.
+
+**`GGML_SYCL_USE_ASYNC_MEM_OP=0` does not avoid the cost** — the same 520 MiB is allocated, merely
+attributed to `direct` because `sycl_ext_malloc_device` falls through to `ggml_sycl_malloc_device`.
+Only the *free* path changes: `async_free` returns to a driver pool (retained), a real `free` returns
+it. So the peak must be budgeted either way; retention only decides whether it also permanently eats
+the margin.
+
+**Fix options**, cheapest first:
+
+1. **Reorder in chunks.** The scratch is a staging copy; slicing the tensor bounds it to a fixed
+   working-set instead of the largest tensor. Removes ~1 GiB of demand outright and needs no
+   accounting changes.
+2. **Allocate it through a `ggml_backend_buffer`** so it lands in `mb.model` and the fitter sees it.
+3. **At minimum**, add the peak to the fit budget the way the draft/MTP context already is
+   (`tools/server/server-context.cpp:1069`).
+
+**Caveat if reproducing on an iGPU:** the breakdown's `unaccounted` column is meaningless on UMA
+hardware — `total`/`free` are *system* RAM, so `total - free - self` absorbs every other process
+(observed: 44339 MiB). Use `GGML_SYCL_MEMTRACE`, which is process-local, not the breakdown.
 
 ---
 
@@ -178,12 +304,10 @@ Two conclusions:
   model loaded occupies 126 MiB of device memory (32656 − 32530), which is device-wide and therefore
   outside any child's accounting. Note this is automatically handled by the fitter, since it queries
   free memory device-wide.
-- **There is no ~1.2 GiB fixed cost** (an earlier reading of this data was wrong). But `n_ctx = 182016`
-  showed **1660 MiB at load**, ~1200 MiB above the floor, so a term proportional to `n_ctx` exists and
-  is negligible at 32768 while dominant at 182016. A floor of ~250 MiB plus ~6.7 KiB/token is roughly
-  consistent with all three points (predicting 305 / 465 / 1470 against measured 490 / 445 / 1660) but
-  the fit is not good enough to trust. **The gap between 32768 and 182016 needs filling** — presets
-  pinned at `--ctx-size 65536` and `131072` would show whether it is linear or a step.
+- **The jump above 32768 is a step, not a slope.** The 65536/131072 sweep in §2.5 measured 1561 MiB at
+  *both*, so between 32768 (~450 MiB) and 65536 (~1561 MiB) something switches on and then stops
+  scaling. A per-token model is therefore falsified; look for a threshold, e.g. a kernel-selection
+  change (`GGML_SYCL_MKL_FA_DEBUG=1` names the kernel per call) or a pool reserve granularity.
 
 Incidental regularity worth knowing: `mb.context` was **exactly `KV + 149 MiB`** in all seven 27B
 configurations, so `mb.context` itself is well-behaved and the KV cache accounting is sound.
@@ -199,27 +323,33 @@ Remaining candidates for the floor, none yet confirmed:
 
 ## 4. Proposed work, staged
 
-### 4.1 Stage 1 (prerequisite): attribute every device allocation
+### 4.1 Stage 1 (prerequisite): attribute every device allocation — **implemented**
 
-Without this, Class C is guesswork. Add, behind an env guard in the style of the existing
-`GGML_SYCL_MKL_FA_DEBUG` (`fattn.cpp:278`):
+`GGML_SYCL_MEMTRACE=1` (`ggml/src/ggml-sycl/memtrace.{hpp,cpp}`) tracks every device allocation by
+site with live and peak bytes, logging whenever the peak grows by `GGML_SYCL_MEMTRACE_STEP` MiB
+(default 64) and whenever anything queries device memory — so a `/metrics` scrape also dumps the
+attribution. Sites:
 
-1. A counter around every device allocation that does **not** pass through a `ggml_backend_buffer` —
-   `ggml_sycl_pool_leg::alloc`, `ggml_sycl_pool_vmm::alloc` (`:1744` is the failing site),
-   `ggml_sycl_fattn_kv_buffers::kv_buffer::ensure_half`, `sycl_reorder_temp_buffer`, and any bare
-   `sycl::malloc_device` / `sycl::malloc_host`.
-2. Log request size, running total, and high-water per site.
-3. One line in `ggml_sycl_flash_attn_ext_onednn` reporting `n_kv`, `Hkv`, `d`, and the exact bytes
-   requested for K, V, Q, mask, out.
+| site | meaning |
+|---|---|
+| `buffer` | passes through a `ggml_backend_buffer`; should reconcile with `model + context + compute` |
+| `pool_leg` | `ggml_sycl_pool_leg`, retained until context teardown |
+| `pool_vmm` | `ggml_sycl_pool_vmm` physical pages mapped into the reserved range |
+| `async` | `syclex::async_malloc`; `async_free` returns to a **driver pool, not the OS** |
+| `fattn_kv` | `ggml_sycl_fattn_kv_buffers`, grow-only F16 K/V staging |
+| `direct` | anything else |
 
-Ship the pool high-water as a gauge too — this deployment already scrapes `llamacpp:*` into
-Mimir/Grafana, so exposing `pool_size` / high-water makes the whole class observable without a rebuild
-next time. Suggested: `llamacpp:sycl_pool_bytes`, `llamacpp:sycl_pool_peak_bytes`.
+Hooks sit at four choke points: `ggml_sycl_malloc_device` (which gained a defaulted `site` parameter,
+so existing callers are unchanged), the VMM pool's page mapping, `sycl_ext_malloc_device` /
+`sycl_ext_free`, and `ggml_sycl_fattn_kv_buffers::ensure_half`. Off and near-free when unset.
 
-**Exit criterion:** both the ~450 MiB load-time floor and the large-`n_ctx` load-time term (§3,
-Class C) are attributed to named call sites, summing to within ~50 MiB. Cheap first step, no code
-needed: pin `--ctx-size` at 65536 and 131072 to establish whether the large-`n_ctx` term is linear or a
-step, since that determines whether Stage 2's reservation subsumes it.
+**Exit criterion:** the ~1561 MiB base term (27B) and the ~1484–2252 MiB MTP term are attributed to
+named sites summing to within ~50 MiB, and `buffer` reconciles with the breakdown's `self`.
+
+Still to add: a line in `ggml_sycl_flash_attn_ext_onednn` reporting `n_kv`, `Hkv`, `d` and the exact
+bytes requested for K, V, Q, mask, out; and exposing the peak as `llamacpp:sycl_pool_peak_bytes` so
+this is observable in Grafana without a rebuild.
+
 
 ### 4.2 Stage 2: reserve FA staging in the compute buffer (port the CUDA fix)
 
