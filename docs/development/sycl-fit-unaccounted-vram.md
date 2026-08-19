@@ -237,6 +237,25 @@ Note also that allocation failure is **already handled gracefully** (`:3908`): i
 false, and the reorder is skipped. So the memory is not optional-but-wasted — it is required for the
 optimisation, and the optimisation is already skippable.
 
+**Measured: capping the reorder is NOT a good fix.** `GGML_SYCL_REORDER_MAX_MIB=N` (added alongside
+this investigation, default 0 = no limit) skips the reorder for tensors above `N` MiB, which is safe
+because declining is already a supported path. On the iGPU with `Qwen3.8-27B-UD-Q2_K_XL`,
+`--ctx-size 65536 --ubatch-size 4096`, a ~4900-token prefill:
+
+| | uncapped | `REORDER_MAX_MIB=256` |
+|---|---|---|
+| `async` (reorder scratch) | 520 MiB | 0 |
+| `pool_vmm` | 2 MiB | **306 MiB** |
+| total unaccounted | 522 MiB | **306 MiB** |
+| prompt throughput | **91.2 t/s** | 61.4 t/s |
+| generation | 2.0 t/s | 1.9 t/s |
+
+It recovers only 216 of 520 MiB, because the un-reordered tensor falls back to a mul_mat path that
+dequantizes into the scratch pool — the memory moves rather than disappearing — and costs **33 % of
+prefill throughput**. Keep the knob as an escape hatch for someone who is a few hundred MiB short of
+loading at all, but it is not the fix. (Ratios will differ on other hardware and quants; the mechanism
+— un-reordered mul_mat needs pool scratch — is architectural.)
+
 **Fix options**, cheapest first:
 
 1. **Account for it.** Allocate the scratch through a `ggml_backend_buffer` so it lands in `mb.model`,

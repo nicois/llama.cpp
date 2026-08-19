@@ -90,6 +90,12 @@
 static bool g_sycl_loaded = false;
 int g_ggml_sycl_debug = 0;
 int g_ggml_sycl_enable_optimize = 1;
+// Skip the weight reorder for tensors larger than this many MiB. The reorder stages a
+// full-size copy of the tensor (see sycl_reorder_temp_buffer), and that scratch is not
+// visible to llama.cpp's memory breakdown, so on a nearly-full device the largest tensor
+// (typically output.weight, ~1 GiB for a 27B) can be the difference between loading and
+// not. 0 = no limit, preserving the previous behaviour.
+int g_ggml_sycl_reorder_max_mib = 0;
 int g_ggml_sycl_enable_graph = 0;
 int g_ggml_sycl_enable_dnn = 1;
 int g_ggml_sycl_fa_onednn = 1;
@@ -300,6 +306,7 @@ static void ggml_check_sycl() try {
     if (!initialized) {
         g_ggml_sycl_debug = ggml_sycl_get_env("GGML_SYCL_DEBUG", 0);
         g_ggml_sycl_enable_optimize = ggml_sycl_get_env("GGML_SYCL_ENABLE_OPT", 1);
+        g_ggml_sycl_reorder_max_mib = ggml_sycl_get_env("GGML_SYCL_REORDER_MAX_MIB", 0);
         g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
@@ -394,6 +401,7 @@ static void ggml_check_sycl() try {
 #endif
 
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_OPT: %d\n", g_ggml_sycl_enable_optimize);
+        GGML_LOG_INFO("  GGML_SYCL_REORDER_MAX_MIB: %d\n", g_ggml_sycl_reorder_max_mib);
 
 #if defined(GGML_SYCL_SUPPORT_VMM)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
@@ -4409,9 +4417,24 @@ static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_ten
            dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
 }
 
+// The reorder stages a full-size copy of the tensor, so peak scratch is the largest reordered
+// tensor. Declining is safe -- it is the same path taken when that allocation fails.
+static bool reorder_scratch_within_budget(const ggml_tensor * src0) {
+    if (g_ggml_sycl_reorder_max_mib <= 0) {
+        return true;
+    }
+    const size_t bytes = ggml_nbytes(src0);
+    if (bytes <= (size_t) g_ggml_sycl_reorder_max_mib * 1024 * 1024) {
+        return true;
+    }
+    GGML_SYCL_DEBUG("[SYCL] skipping reorder of %s: %zu MiB exceeds GGML_SYCL_REORDER_MAX_MIB=%d\n",
+                    src0->name, bytes / 1024 / 1024, g_ggml_sycl_reorder_max_mib);
+    return false;
+}
+
 static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                             ggml_tensor * dst, mul_mat_algo mm_algorithm) {
-    if (!should_reorder_tensor(*ctx, dst)) {
+    if (!should_reorder_tensor(*ctx, dst) || !reorder_scratch_within_budget(src0)) {
         return;
     }
 
@@ -4449,6 +4472,9 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
         return;
     }
     if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K) {
+        return;
+    }
+    if (!reorder_scratch_within_budget(src0)) {
         return;
     }
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
