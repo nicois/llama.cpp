@@ -5892,6 +5892,9 @@ static void ggml_backend_sycl_device_get_memory(ggml_backend_dev_t dev, size_t *
     ggml_sycl_set_device(ctx->device);
     SYCL_CHECK(CHECK_TRY_ERROR(
     dpct::dev_mgr::instance().get_device(ctx->device).get_memory_info(*free, *total)));
+    // Aligns a GGML_SYCL_MEMTRACE dump with every memory-breakdown print, since
+    // common_memory_breakdown_print() reaches the backend through this entry point.
+    ggml_sycl_memtrace_report("device memory query (dev)");
 }
 
 static enum ggml_backend_dev_type ggml_backend_sycl_device_get_type(ggml_backend_dev_t dev) {
