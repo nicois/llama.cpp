@@ -274,6 +274,59 @@ loading at all, but it is not the fix. (Ratios will differ on other hardware and
 hardware — `total`/`free` are *system* RAM, so `total - free - self` absorbs every other process
 (observed: 44339 MiB). Use `GGML_SYCL_MEMTRACE`, which is process-local, not the breakdown.
 
+### 2.7 The accounting closes: most of it is the vision encoder
+
+Running `GGML_SYCL_MEMTRACE=1` on the B70 itself gave the full event sequence for
+`Qwen3.8-27B-large-ff-64k` (`n_ctx` 65536, `--fit off`, `GGML_SYCL_USE_ASYNC_MEM_OP=0`):
+
+```
+ 1.07s  +15718 buffer -> 15718    weights
+ 3.09s   +4096 buffer -> 19814    KV cache
+ 3.13s    +149 buffer -> 19964    context overhead
+ 3.15s   +1488 buffer -> 21452    compute        <- equals `self` exactly
+35.37s     +69 direct -> 21523    reorder scratch (a smaller tensor)
+35.44s    +994 direct -> 22448    reorder scratch (output.weight), freed -> live 0
+35.78s    +248 buffer -> 22590    buffer now 22588   <- +1136 MiB over `self`
+35.86s     +98 pool_vmm
+36.21s     +68 pool_vmm -> pool_vmm 170 MiB
+breakdown: 32656 = 9626 + (21452 = 15718 + 4245 + 1488) + 1577
+```
+
+Two conclusions.
+
+**The reorder scratch is not the resident cost.** With `GGML_SYCL_USE_ASYNC_MEM_OP=0` the 994 MiB is
+allocated and then properly freed (`direct live` returns to 0), yet `unaccounted` is still 1577 MiB.
+The driver-pool retention theory is **falsified**: that env var is not a workaround. The scratch remains
+a real *transient* spike that the fitter does not budget — enough to make a model that "just fits" fail
+during load — but it is not what occupies memory afterwards.
+
+**The resident term is the multimodal projector.** The +1136 MiB of `buffer` allocations at 35.78s are
+the vision encoder: the child reports its load stages as
+`{"stages":["text_model","mmproj_model"]}`, and `mmproj-BF16.gguf` for this repo is ~1.1 GiB. Because
+`common_memory_breakdown_print` reports `llama_get_memory_breakdown(ctx)` for the *language* context
+only, the mtmd/clip context's device buffers are invisible to it — and therefore to `--fit`. (Most of
+those allocations did not log individually because the reorder scratch had already raised the peak, so
+`total_live` stayed below it until the +248 MiB allocation crossed over.)
+
+That closes the accounting:
+
+| term | MiB |
+|---|---|
+| mmproj (vision encoder) | ~1136 |
+| `pool_vmm` | 170 |
+| router process's own SYCL context | 126 |
+| driver / Level Zero / rounding | ~145 |
+| **total** | **1577** |
+
+**Immediate mitigation, no code:** pass `--no-mmproj-auto` for text-only serving. It recovers ~1.1 GiB
+outright. The older presets in this deployment carried that flag; the `-large-*` ones did not, and the
+model revision ships an mmproj, which is why this appeared. Note this is **not SYCL-specific** — the
+mmproj accounting gap would affect CUDA identically.
+
+**The defect to fix:** `--fit` budgets on `mb.total()`, which omits (a) the mtmd/clip context's device
+buffers entirely and (b) the transient reorder scratch. Both need to be included before a small
+`--fit-target` can mean what it says. The mmproj term is the larger and the easier of the two.
+
 ---
 
 ## 3. Root cause: three classes of unaccounted device memory
