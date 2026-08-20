@@ -405,42 +405,77 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(int device, const ggml_tensor * 
         return p;
     };
 
-    switch (ggml_sycl_get_best_fattn_kernel(device, dst)) {
-        case BEST_FATTN_KERNEL_ONEDNN:
-            // Stages Q, K, V and the output densely as F16 regardless of the KV type,
-            // plus a one-element scale scalar.
-            e.Q     = take((size_t) Q->ne[2] * Q->ne[1] * K->ne[0]);
-            e.K     = take((size_t) ggml_nelements(K));
-            e.V     = take((size_t) ggml_nelements(V));
-            e.scale = take(1);
-            e.out   = take((size_t) Q->ne[2] * Q->ne[1] * K->ne[0]);
-            break;
+    // Which kernel runs is decided per call from n_kv and the Q row count, and those
+    // differ between the worst-case graph reserved here and the ubatches actually
+    // executed later. Reserving only for the kernel selected *now* would therefore leave
+    // a different kernel unfunded at runtime -- observed on Battlemage, where reserve
+    // time selects MKL (which needs nothing) while prefill runs oneDNN (which needs
+    // several hundred MiB). So reserve the maximum requirement over every kernel that
+    // could run for these types on this device, using only type/arch conditions that do
+    // not vary with shape.
+    const int64_t d = K->ne[0];
+    const int64_t H = Q->ne[2];
+    const int64_t q = Q->ne[1];
 
-        case BEST_FATTN_KERNEL_TILE: {
-            // TILE always requests F16 K/V, so anything else needs staging.
-            const bool V_is_K_view = V->view_src &&
-                (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
-            if (K->type != GGML_TYPE_F16) {
-                e.K = take((size_t) ggml_nelements(K));
-            }
-            if (V->type != GGML_TYPE_F16) {
-                e.V = V_is_K_view ? e.K : take((size_t) ggml_nelements(V));
-            }
-            break;
+    bool onednn_possible = false;
+#if GGML_SYCL_DNNL
+    if (g_ggml_sycl_fa_onednn) {
+        const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
+        const bool arch_ok  = arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31;
+        auto type_ok = [](ggml_type t) {
+            return t == GGML_TYPE_F16 || t == GGML_TYPE_F32 || t == GGML_TYPE_Q4_0 ||
+                   t == GGML_TYPE_Q4_1 || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 ||
+                   t == GGML_TYPE_Q8_0;
+        };
+        onednn_possible = arch_ok && type_ok(K->type) && type_ok(V->type);
+    }
+#endif
+
+    // TILE always asks for F16 K/V, so anything else has to be staged.
+    const bool tile_needs_K = K->type != GGML_TYPE_F16;
+    const bool tile_needs_V = V->type != GGML_TYPE_F16;
+
+    const bool V_is_K_view = V->view_src &&
+        (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+
+    size_t need_K = 0, need_V = 0, need_Q = 0, need_out = 0, need_scale = 0;
+    if (onednn_possible) {
+        need_Q     = (size_t) H * q * d;
+        need_out   = (size_t) H * q * d;
+        need_scale = 1;
+        need_K     = (size_t) ggml_nelements(K);
+        need_V     = (size_t) ggml_nelements(V);
+    }
+    if (tile_needs_K) {
+        need_K = std::max(need_K, (size_t) ggml_nelements(K));
+    }
+    if (tile_needs_V) {
+        need_V = std::max(need_V, (size_t) ggml_nelements(V));
+    }
+
+    e.Q     = take(need_Q);
+    e.K     = take(need_K);
+    // TILE aliases V onto K when V is a view of K; oneDNN never aliases, so only take
+    // that shortcut when oneDNN cannot run and would not need its own copy.
+    e.V     = (V_is_K_view && !onednn_possible && need_V) ? e.K : take(need_V);
+    e.scale = take(need_scale);
+    e.out   = take(need_out);
+
+    static int dbg = ggml_sycl_get_env("GGML_SYCL_FA_RESERVE_DEBUG", 0);
+    if (dbg) {
+        const char * kn = "?";
+        switch (ggml_sycl_get_best_fattn_kernel(device, dst)) {
+            case BEST_FATTN_KERNEL_ONEDNN: kn = "ONEDNN"; break;
+            case BEST_FATTN_KERNEL_MKL:    kn = "MKL";    break;
+            case BEST_FATTN_KERNEL_TILE:   kn = "TILE";   break;
+            case BEST_FATTN_KERNEL_VEC:    kn = "VEC";    break;
+            case BEST_FATTN_KERNEL_NONE:   kn = "NONE";   break;
         }
-
-        case BEST_FATTN_KERNEL_VEC:
-            // Reads quantized K/V natively; need_f16_* is only set for types that are
-            // already F16, making the conversion a no-op. Nothing to reserve.
-            break;
-
-        case BEST_FATTN_KERNEL_MKL:
-            // Dequantizes one KV-head chunk at a time, so its scratch is bounded and
-            // does not scale with n_kv. Left on the pool.
-            break;
-
-        case BEST_FATTN_KERNEL_NONE:
-            break;
+        GGML_LOG_INFO("[FA-RESERVE] kernel=%s n_kv=%lld Qrows=%lld Ktype=%s "
+                      "dst=%zu reserved=%zu MiB\n", kn,
+                      (long long) K->ne[1], (long long) Q->ne[1],
+                      ggml_type_name(K->type), ggml_nbytes(dst),
+                      (size_t) ((e.end - (uintptr_t) dst->data - ggml_nbytes(dst)) / 1024 / 1024));
     }
 
     return e;
