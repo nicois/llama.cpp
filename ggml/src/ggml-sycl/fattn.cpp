@@ -374,3 +374,79 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
 bool ggml_sycl_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_sycl_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+
+ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(int device, const ggml_tensor * dst) {
+    ggml_sycl_fattn_extra e;
+
+    // Callable before dst->data is assigned (get_alloc_size runs at allocation time), in
+    // which case this is 0 and the result is a pure size. Safe because ggml buffers are
+    // SYCL_BUFFER_ALIGNMENT (128) aligned, so the padding below is base-independent.
+    e.end = (uintptr_t) dst->data + ggml_nbytes(dst);
+
+    static int reserve = ggml_sycl_get_env("GGML_SYCL_FA_RESERVE", 1);
+    if (!reserve || dst->op != GGML_OP_FLASH_ATTN_EXT) {
+        return e;   // 0 fields -> callers fall back to pool allocation
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (!Q || !K || !V) {
+        return e;
+    }
+
+    auto take = [&e](size_t n_halves) -> uintptr_t {
+        if (n_halves == 0) {
+            return 0;
+        }
+        e.end = (e.end + 127) & ~(uintptr_t) 127;
+        const uintptr_t p = e.end;
+        e.end += n_halves * sizeof(sycl::half);
+        return p;
+    };
+
+    switch (ggml_sycl_get_best_fattn_kernel(device, dst)) {
+        case BEST_FATTN_KERNEL_ONEDNN:
+            // Stages Q, K, V and the output densely as F16 regardless of the KV type,
+            // plus a one-element scale scalar.
+            e.Q     = take((size_t) Q->ne[2] * Q->ne[1] * K->ne[0]);
+            e.K     = take((size_t) ggml_nelements(K));
+            e.V     = take((size_t) ggml_nelements(V));
+            e.scale = take(1);
+            e.out   = take((size_t) Q->ne[2] * Q->ne[1] * K->ne[0]);
+            break;
+
+        case BEST_FATTN_KERNEL_TILE: {
+            // TILE always requests F16 K/V, so anything else needs staging.
+            const bool V_is_K_view = V->view_src &&
+                (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+            if (K->type != GGML_TYPE_F16) {
+                e.K = take((size_t) ggml_nelements(K));
+            }
+            if (V->type != GGML_TYPE_F16) {
+                e.V = V_is_K_view ? e.K : take((size_t) ggml_nelements(V));
+            }
+            break;
+        }
+
+        case BEST_FATTN_KERNEL_VEC:
+            // Reads quantized K/V natively; need_f16_* is only set for types that are
+            // already F16, making the conversion a no-op. Nothing to reserve.
+            break;
+
+        case BEST_FATTN_KERNEL_MKL:
+            // Dequantizes one KV-head chunk at a time, so its scratch is bounded and
+            // does not scale with n_kv. Left on the pool.
+            break;
+
+        case BEST_FATTN_KERNEL_NONE:
+            break;
+    }
+
+    return e;
+}
+
+size_t ggml_sycl_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
+    const ggml_sycl_fattn_extra e = ggml_sycl_fattn_get_extra(device, dst);
+    return (size_t) (e.end - (uintptr_t) dst->data);
+}
