@@ -318,14 +318,37 @@ That closes the accounting:
 | driver / Level Zero / rounding | ~145 |
 | **total** | **1577** |
 
-**Immediate mitigation, no code:** pass `--no-mmproj-auto` for text-only serving. It recovers ~1.1 GiB
-outright. The older presets in this deployment carried that flag; the `-large-*` ones did not, and the
-model revision ships an mmproj, which is why this appeared. Note this is **not SYCL-specific** — the
-mmproj accounting gap would affect CUDA identically.
+**Correction: `--fit` already budgets the mmproj.** `tools/server/server-context.cpp:1003-1027` calls
+`mtmd_get_memory_usage()` and adds the result to `fit_params_target`, and the logs confirm it works:
 
-**The defect to fix:** `--fit` budgets on `mb.total()`, which omits (a) the mtmd/clip context's device
-buffers entirely and (b) the transient reorder scratch. Both need to be included before a small
-`--fit-target` can mean what it says. The mmproj term is the larger and the easier of the two.
+```
+[mtmd] estimated worst-case memory usage of mmproj is 1161.02 MiB
+[mtmd] adding 1136.09 MiB to fit_params_target for device SYCL0
+[spec] adding 3616.13 MiB to fit_params_target for device SYCL0
+```
+
+1136.09 MiB is exactly the buffer growth measured above, and it is what turns `--fit-target 1024` into
+the effective 2160 MiB seen in §2.4 (1024 + 1136) — earlier attributed here to the MTP context, which
+was wrong: for a preset with MTP the `[spec]` line adds a further 3616 MiB. So the mmproj and the draft
+context are **both correctly reserved**; they appear as `unaccounted` only because
+`common_memory_breakdown_print` reports `llama_get_memory_breakdown(ctx)` for the language context
+alone. That is a **reporting** gap, not a budgeting gap — but a costly one, because it makes correctly
+reserved memory look like a leak (it misled this investigation twice).
+
+**Still worth a small PR:** include the mtmd/clip context's device buffers in the memory breakdown, so
+`unaccounted` means what it says.
+
+**Immediate mitigation, no code:** pass `--no-mmproj-auto` for text-only serving. It recovers ~1.1 GiB
+of reservation *and* allocation. The older presets in this deployment carried that flag; the `-large-*`
+ones did not, and the model revision ships an mmproj, which is why this appeared.
+
+**The one real remaining defect is the depth-dependent growth.** Reconciling the OOM in §2.1 with all
+of the above: `-large-88-mtp` targeted 1024 + 1136 + 3616 = 5776 MiB, fitted `n_ctx` 197632, and after
+the mmproj and draft context actually loaded it was left with ~1190 MiB free — as designed. It then
+died at 60 % depth because device usage *grows with context depth* by +1871 MiB for q8_0 KV (§2.2),
+which nothing budgets. That growth is `pool_vmm`, i.e. the flash-attention staging scaling with `n_kv`
+— exactly what CUDA reserves up front in #23907 (§4.2). The fitter reserves a fixed margin; the
+requirement is not fixed.
 
 ---
 
