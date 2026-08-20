@@ -350,6 +350,45 @@ which nothing budgets. That growth is `pool_vmm`, i.e. the flash-attention stagi
 — exactly what CUDA reserves up front in #23907 (§4.2). The fitter reserves a fixed margin; the
 requirement is not fixed.
 
+### 2.8 Controlled A/B: the accounting closes at 424 MiB
+
+Single-variable runs on the B70 with the instrumented build, `-large-ff-64k` (`n_ctx` 65536,
+`--fit off`), same model revision:
+
+| config | `self` | `buffer` | scratch site | **unaccounted** |
+|---|---|---|---|---|
+| async **off**, mmproj **on** | 21452 | 22588 | `direct` 994 MiB, freed | **1577** |
+| async **on**, mmproj **off** (`--no-mmproj-auto`) | 21452 | **21452** | `async` 994 MiB, freed | **424** |
+
+- **`async_free` does not retain.** The 1153 MiB difference is the mmproj (1136 MiB), leaving 17 MiB
+  attributable to the allocator. `GGML_SYCL_USE_ASYNC_MEM_OP` is not a memory lever; the scratch is
+  correctly freed either way, and only the memtrace *site label* changes (`async` vs `direct`).
+- **`buffer` == `self` exactly** once the mmproj is gone, confirming the earlier 1136 MiB gap was the
+  vision encoder and nothing else.
+
+Final decomposition of the residual, for a text-only 27B at `n_ctx` 65536:
+
+| term | MiB |
+|---|---|
+| `pool_vmm` (scratch pool high-water) | ~170 |
+| router process's own SYCL context | 126 |
+| driver / Level Zero / allocation rounding | ~128 |
+| **total `unaccounted`** | **424** |
+
+The reorder scratch still spikes the *peak* to 22448 MiB during load (994 MiB above `self`) and is not
+budgeted — a model that fits in steady state can still fail to load. But it is freed, so it does not
+appear in the residual.
+
+**Implication for a small `--fit-target`.** The floor is now ~424 MiB, of which only ~170 MiB is
+llama.cpp's own (the pool). The remaining ~254 MiB is the router's separate process plus driver
+overhead — not something the fitter can shrink, but it *is* already handled implicitly, because the
+fitter sizes against *free* device memory and those bytes are already absent from it. So the reachable
+target is bounded below by the pool high-water plus the transient reorder peak, not by 424 MiB.
+
+Note also that disabling the mmproj drops the effective fit target from 2160 back to 1024 MiB (§2.7),
+so `--fit` will now choose a **larger** context than before for the same card. That is correct
+behaviour, not a regression.
+
 ---
 
 ## 3. Root cause: three classes of unaccounted device memory
