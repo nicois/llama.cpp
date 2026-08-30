@@ -982,11 +982,24 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
     GGML_UNUSED(buft);
 }
 
+struct ggml_sycl_mul_mat_extra {
+    uintptr_t src0_cvt = 0;   // converted weight slice, 0 if no conversion needed
+    uintptr_t src1_cvt = 0;   // converted activations
+    size_t    elt_size = 0;   // 2 for f16/bf16 paths, 4 for the f32 fallback
+    uintptr_t end      = 0;
+};
+
+static ggml_sycl_mul_mat_extra ggml_sycl_mul_mat_get_extra(const ggml_tensor * dst);
+
 static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     // Reserve the additional scratch so it's visible to the graph allocator
-    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
-        ? ggml_sycl_flash_attn_ext_get_alloc_size(tensor)
-        : ggml_nbytes(tensor);
+    size_t size = ggml_nbytes(tensor);
+    if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+        size = ggml_sycl_flash_attn_ext_get_alloc_size(tensor);
+    } else if (tensor->op == GGML_OP_MUL_MAT) {
+        const ggml_sycl_mul_mat_extra e = ggml_sycl_mul_mat_get_extra(tensor);
+        size = (size_t) (e.end - (uintptr_t) tensor->data);
+    }
     int64_t ne0 = tensor->ne[0];
 
     if (ggml_is_quantized(tensor->type)) {
@@ -2829,6 +2842,93 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// Scratch that ggml_sycl_op_mul_mat_sycl() needs to convert its inputs for the GEMM.
+//
+// The vector paths (dequantize_mul_mat_vec, mul_mat_vec_q) read quantized weights
+// directly, but the GEMM path converts the whole weight slice -- and the activations --
+// into a temporary. Taken from the scratch pool that was invisible to
+// llama_get_memory_breakdown(), and since the pool only ever grows (a free returns the
+// buffer to a free list, and the VMM pool unmaps only at teardown) the peak is resident
+// for the process lifetime. So --fit budgeted against a figure that is guaranteed wrong
+// the moment a prefill runs; on an Arc Pro B70 this ran the device out of memory after
+// 4,572 tokens.
+//
+// Reserved on the MUL_MAT output tensor instead. The graph allocator reuses across
+// nodes, and only one matmul is in flight at a time, so the reservation collapses to the
+// largest single node's requirement rather than summing.
+//
+// This is the single source of truth for the layout: used both to size the reservation
+// and to hand out the pointers, so the two cannot disagree. Bounds are upper bounds --
+// the caller may chunk columns (src1_ncols <= ne11) and split rows across devices
+// (row_diff <= ne01), and reserving the unchunked size covers every such call.
+
+static ggml_sycl_mul_mat_extra ggml_sycl_mul_mat_get_extra(const ggml_tensor * dst) {
+    ggml_sycl_mul_mat_extra e;
+    // Callable before dst->data is assigned (get_alloc_size runs at allocation time), in
+    // which case this is 0 and the result is a pure size; safe because ggml buffers are
+    // SYCL_BUFFER_ALIGNMENT (128) aligned, so the padding below is base-independent.
+    e.end = (uintptr_t) dst->data + ggml_nbytes(dst);
+
+    static int reserve = ggml_sycl_get_env("GGML_SYCL_MM_RESERVE", 1);
+    if (!reserve || dst->op != GGML_OP_MUL_MAT) {
+        return e;
+    }
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (!src0 || !src1) {
+        return e;
+    }
+    // Below this the vector kernels are used and nothing is converted. MMQ would be the
+    // next tier but ggml_sycl_supports_mmq() is unconditionally false.
+    if (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
+        return e;
+    }
+    if (!ggml_is_contiguous(src0)) {
+        return e;   // every conversion path here requires it
+    }
+
+    ggml_type want0, want1;
+#if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
+    if (src0->type == GGML_TYPE_BF16 && g_ggml_sycl_enable_dnn) {
+        // bf16 fast path converts only the activations
+        e.elt_size = sizeof(sycl::ext::oneapi::bfloat16);
+        want0 = GGML_TYPE_BF16;
+        want1 = GGML_TYPE_BF16;
+    } else
+#endif
+#ifdef GGML_SYCL_F16
+    if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) &&
+        dst->op_params[0] == GGML_PREC_DEFAULT) {
+        e.elt_size = sizeof(sycl::half);
+        want0 = GGML_TYPE_F16;
+        want1 = GGML_TYPE_F16;
+    } else
+#endif
+    {
+        e.elt_size = sizeof(float);
+        want0 = GGML_TYPE_F32;
+        want1 = GGML_TYPE_F32;
+    }
+
+    auto take = [&e](size_t n) -> uintptr_t {
+        if (n == 0) {
+            return 0;
+        }
+        e.end = (e.end + 127) & ~(uintptr_t) 127;
+        const uintptr_t p = e.end;
+        e.end += n * e.elt_size;
+        return p;
+    };
+
+    if (src0->type != want0) {
+        e.src0_cvt = take((size_t) src0->ne[0] * src0->ne[1]);
+    }
+    if (src1->type != want1) {
+        e.src1_cvt = take((size_t) src1->ne[0] * src1->ne[1]);
+    }
+    return e;
+}
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -2846,6 +2946,10 @@ inline void ggml_sycl_op_mul_mat_sycl(
     GGML_ASSERT(ne00 == ne10);
 
     const int64_t row_diff = row_high - row_low;
+
+    // Prefer the space reserved on `dst` by get_alloc_size; fall back to the scratch pool
+    // when reservation is disabled (GGML_SYCL_MM_RESERVE=0).
+    const ggml_sycl_mul_mat_extra mm_extra = ggml_sycl_mul_mat_get_extra(dst);
 
     int id;
     SYCL_CHECK(
@@ -2867,17 +2971,21 @@ inline void ggml_sycl_op_mul_mat_sycl(
     if (src0->type == GGML_TYPE_BF16 && g_ggml_sycl_enable_dnn && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1]) {
         using bf16_t = sycl::ext::oneapi::bfloat16;
-        ggml_sycl_pool_alloc<bf16_t> src1_as_bf16(ctx.pool(), src1_ncols*ne10);
+        ggml_sycl_pool_alloc<bf16_t> src1_as_bf16(ctx.pool());
+        bf16_t * src1_bf16_ptr = (bf16_t *) mm_extra.src1_cvt;
+        if (!src1_bf16_ptr) {
+            src1_bf16_ptr = src1_as_bf16.alloc(src1_ncols*ne10);
+        }
         if (src1->type != GGML_TYPE_BF16) {
             const to_bf16_sycl_t to_bf16_sycl = ggml_get_to_bf16_sycl(src1->type, dst);
             GGML_ASSERT(to_bf16_sycl != nullptr);
-            to_bf16_sycl(src1_ddf_i, src1_as_bf16.get(), src1_ncols*ne10, stream);
+            to_bf16_sycl(src1_ddf_i, src1_bf16_ptr, src1_ncols*ne10, stream);
         } else {
-            stream->memcpy(src1_as_bf16.get(), src1_ddf_i, src1_ncols*ne10*sizeof(bf16_t));
+            stream->memcpy(src1_bf16_ptr, src1_ddf_i, src1_ncols*ne10*sizeof(bf16_t));
         }
         DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10,
                                   src0_dd_i, DnnlGemmWrapper::to_dt<bf16_t>(),
-                                  src1_as_bf16.get(), DnnlGemmWrapper::to_dt<bf16_t>(),
+                                  src1_bf16_ptr, DnnlGemmWrapper::to_dt<bf16_t>(),
                                   dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
         GGML_UNUSED(dst);
         GGML_UNUSED(src1_ddq_i);
@@ -2889,32 +2997,38 @@ inline void ggml_sycl_op_mul_mat_sycl(
     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
         ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
+        sycl::half * src0_f16_ptr = (sycl::half *) mm_extra.src0_cvt;
         if (src0->type != GGML_TYPE_F16) {
             scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
                                                  " : converting src0 to fp16");
             const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src0->type, dst);
             GGML_ASSERT(to_fp16_sycl != nullptr);
             size_t ne = row_diff*ne00;
-            src0_as_f16.alloc(ne);
-            to_fp16_sycl(src0_dd_i, src0_as_f16.get(), ne, stream);
+            if (!src0_f16_ptr) {
+                src0_f16_ptr = src0_as_f16.alloc(ne);
+            }
+            to_fp16_sycl(src0_dd_i, src0_f16_ptr, ne, stream);
         }
         const sycl::half *src0_ptr = src0->type == GGML_TYPE_F16
                                          ? (const sycl::half *)src0_dd_i
-                                         : src0_as_f16.get();
+                                         : src0_f16_ptr;
 
         ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
+        sycl::half * src1_f16_ptr = (sycl::half *) mm_extra.src1_cvt;
         if (src1->type != GGML_TYPE_F16) {
             scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
                                                  " : converting src1 to fp16");
             const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
             GGML_ASSERT(to_fp16_sycl != nullptr);
             size_t ne = src1_ncols*ne10;
-            src1_as_f16.alloc(ne);
-            to_fp16_sycl(src1_ddf_i, src1_as_f16.get(), ne, stream);
+            if (!src1_f16_ptr) {
+                src1_f16_ptr = src1_as_f16.alloc(ne);
+            }
+            to_fp16_sycl(src1_ddf_i, src1_f16_ptr, ne, stream);
         }
         const sycl::half *src1_ptr = src1->type == GGML_TYPE_F16
                 ? (const sycl::half *)src1->data + src1_padded_row_size
-                                         : src1_as_f16.get();
+                                         : src1_f16_ptr;
 
 #if GGML_SYCL_DNNL
         if (g_ggml_sycl_enable_dnn) {
@@ -2938,24 +3052,30 @@ inline void ggml_sycl_op_mul_mat_sycl(
     } else {
         ggml_sycl_pool_alloc<float> src0_ddq_as_f32(ctx.pool());
         ggml_sycl_pool_alloc<float> src1_ddq_as_f32(ctx.pool());
+        float * src0_f32_ptr = (float *) mm_extra.src0_cvt;
+        float * src1_f32_ptr = (float *) mm_extra.src1_cvt;
         if (src0->type != GGML_TYPE_F32) {
             scope_op_debug_print scope_dbg_print(__func__, "/to_fp32_sycl", dst, /*num_src=*/2,
                                                  " : converting src0 to fp32");
             const to_fp32_sycl_t to_fp32_sycl = ggml_get_to_fp32_sycl(src0->type, dst);
             GGML_ASSERT(to_fp32_sycl != nullptr);
-            src0_ddq_as_f32.alloc(row_diff*ne00);
-            to_fp32_sycl(src0_dd_i, src0_ddq_as_f32.get(), row_diff*ne00, stream);
+            if (!src0_f32_ptr) {
+                src0_f32_ptr = src0_ddq_as_f32.alloc(row_diff*ne00);
+            }
+            to_fp32_sycl(src0_dd_i, src0_f32_ptr, row_diff*ne00, stream);
         }
         if (src1->type != GGML_TYPE_F32) {
             scope_op_debug_print scope_dbg_print(__func__, "/to_fp32_sycl", dst, /*num_src=*/2,
                                                  " : converting src1 to fp32");
             const to_fp32_sycl_t to_fp32_sycl = ggml_get_to_fp32_sycl(src1->type, dst);
             GGML_ASSERT(to_fp32_sycl != nullptr);
-            src1_ddq_as_f32.alloc(src1_ncols*ne10);
-            to_fp32_sycl(src1_ddf_i, src1_ddq_as_f32.get(), src1_ncols*ne10, stream);
+            if (!src1_f32_ptr) {
+                src1_f32_ptr = src1_ddq_as_f32.alloc(src1_ncols*ne10);
+            }
+            to_fp32_sycl(src1_ddf_i, src1_f32_ptr, src1_ncols*ne10, stream);
         }
-        const float * src0_ddf_i = src0->type == GGML_TYPE_F32 ? (const float *) src0_dd_i : src0_ddq_as_f32.get();
-        const float * src1_ddf1_i = src1->type == GGML_TYPE_F32 ? (const float *) src1_ddf_i : src1_ddq_as_f32.get();
+        const float * src0_ddf_i = src0->type == GGML_TYPE_F32 ? (const float *) src0_dd_i : src0_f32_ptr;
+        const float * src1_ddf1_i = src1->type == GGML_TYPE_F32 ? (const float *) src1_ddf_i : src1_f32_ptr;
 
         {
 #if GGML_SYCL_DNNL
