@@ -2,6 +2,7 @@
 
 #include "build-info.h"
 #include "server-chat.h"
+#include "server-sched.h"
 #include "chat.h"
 #include "common.h"
 #include "json-schema-to-grammar.h"
@@ -1708,7 +1709,9 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt,
+                                                       size_t state_size_tgt,
+                                                       size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1791,40 +1794,28 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    sched_restore_trace trace;
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+    auto it_best_const = sched_pick_restore_baseline(states, tokens_new, prompt.tokens, &trace);
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", trace.base_f_keep, trace.base_f_sim);
 
+    // Emit per-candidate diagnostics in the order the loop examined them
+    auto it_state = states.begin();
+    for (size_t i = 0; i < trace.candidates.size() && it_state != states.end(); ++i, ++it_state) {
+        const auto & c = trace.candidates[i];
+        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n",
+                it_state->prompt.tokens.size(), static_cast<int>(c.lcp), c.f_keep, c.f_sim);
+    }
+
+    // states is non-const here; convert the const_iterator for the mutating path below
     auto it_best = states.end();
-
-    // find the most similar cached prompt, that would also preserve the most context
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
-
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
-
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
-
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
-            continue;
-        }
-
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
-
-            it_best = it;
-        }
+    if (it_best_const != states.end()) {
+        it_best = std::next(states.begin(), std::distance(states.cbegin(), it_best_const));
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
-
+        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", trace.best_f_keep, trace.best_f_sim);
         {
             auto & data = it_best->data.main;
 

@@ -4,6 +4,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-sched.h"
 #include "server-schema.h"
 #include "server-stream.h"
 
@@ -26,6 +27,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <unordered_set>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -1431,6 +1433,36 @@ private:
                 }
                 SRV_DBG("%s", "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__\n");
             }
+        }
+
+        if (params_base.cache_aware_sched) {
+            if (params_base.cache_ram_mib == 0) {
+                SRV_WRN("%s", "--cache-aware-sched requires --cache-ram, disabling\n");
+                params_base.cache_aware_sched = false;
+            } else {
+                SRV_INF("%s", "cache-aware scheduling enabled: queued requests are ranked by "
+                              "resident prefix; requests with no resident prefix may be deferred "
+                              "indefinitely under sustained load\n");
+                SRV_DBG("%s", "__TEST_TAG_CACHE_AWARE_SCHED_ENABLED__\n");
+            }
+        }
+
+        if (params_base.cache_aware_sched) {
+            queue_tasks.set_score_task([this](const server_task & task, int id_slot) {
+                const server_tokens * slot_prompt = nullptr;
+                for (const auto & slot : slots) {
+                    if (slot.id == id_slot) {
+                        slot_prompt = &slot.prompt.tokens;
+                        break;
+                    }
+                }
+
+                static const server_tokens empty;
+                static const sched_states empty_states;
+                return sched_score(task.tokens,
+                                   slot_prompt ? *slot_prompt : empty,
+                                   prompt_cache ? prompt_cache->states : empty_states);
+            });
         }
 
         {

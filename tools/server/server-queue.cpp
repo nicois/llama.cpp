@@ -101,7 +101,36 @@ void server_queue::pop_deferred_task(int id_slot) {
                 break;
             }
         }
-        // if not tasks found using the slot, just pop the first deferred task (default behavior)
+        // rank by resident prefix when cache-aware scheduling is enabled
+        if (!found && callback_score_task) {
+            auto   best       = queue_tasks_deferred.end();
+            size_t best_score = 0;
+
+            for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
+                // only consider unpinned tasks; pinned tasks are already handled above
+                if (it->id_slot != -1) {
+                    continue;
+                }
+
+                const size_t score = callback_score_task(*it, id_slot);
+
+                // strict > keeps FIFO order among equal scores
+                if (best == queue_tasks_deferred.end() || score > best_score) {
+                    best_score = score;
+                    best       = it;
+                }
+            }
+
+            if (best != queue_tasks_deferred.end()) {
+                QUE_DBG("pop deferred task (score %zu), id_task = %d\n", best_score, best->id);
+                QUE_DBG("%s", "__TEST_TAG_SCHED_POP_BY_SCORE__\n");
+                queue_tasks.emplace_front(std::move(*best));
+                queue_tasks_deferred.erase(best);
+                found = true;
+            }
+        }
+
+        // if no task found using the slot, just pop the first deferred task (default behavior)
         if (!found) {
             QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
             queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));

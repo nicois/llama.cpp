@@ -1734,6 +1734,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-aware-sched"},
+        {"--no-cache-aware-sched"},
+        "serve the queued request with the most already-resident prompt first. Raises "
+        "throughput under concurrent multi-turn load at the cost of tail latency: a request "
+        "with no resident prefix may be deferred indefinitely while warmer requests keep "
+        "arriving. (default: disabled, requires cache-ram)",
+        [](common_params & params, bool value) {
+            params.cache_aware_sched = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_AWARE_SCHED").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

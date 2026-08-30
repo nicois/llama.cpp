@@ -45,6 +45,7 @@ private:
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
+    std::function<size_t(const server_task &, int)> callback_score_task;
 
 public:
     ~server_queue() { worker_stop(); }
@@ -134,6 +135,13 @@ public:
     // note: caller will hold mutex_tasks while calling the callbacks
     void on_sleeping_state(std::function<void(bool)> callback) {
         callback_sleeping_state.push_back(std::move(callback));
+    }
+
+    // Rank deferred tasks by how much resident prompt they could reuse on a given slot.
+    // Must be installed before start_loop(). The callback runs while mutex_tasks is held
+    // and on the start_loop thread, so it MUST NOT call back into server_queue.
+    void set_score_task(std::function<size_t(const server_task &, int)> cb) {
+        callback_score_task = std::move(cb);
     }
 
 private:
