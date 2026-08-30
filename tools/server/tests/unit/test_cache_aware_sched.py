@@ -1,36 +1,16 @@
 import os
 import tempfile
 import pytest
-import random
 import time
 from utils import *
 
 server = ServerPreset.tinyllama2()
 
 
-class LogReader:
-    def __init__(self, path):
-        self.path = path
-        self.pos = 0
-    def drain(self):
-        with open(self.path) as f:
-            f.seek(self.pos)
-            content = f.read()
-            self.pos = f.tell()
-        return content
-
-
 @pytest.fixture(autouse=True)
 def create_server():
     global server
-    # Create fresh server instead of using preset to avoid state issues
-    server = ServerProcess()
-    server.offline = True
-    server.model_hf_repo = "ggml-org/test-model-stories260K"
-    server.model_hf_file = None
-    server.model_alias = "tinyllama-2"
-    server.seed = 42
-    server.n_batch = 32
+    server = ServerPreset.tinyllama2()
     server.n_slots = 1
     server.n_ctx = 1024
     server.n_predict = 4
@@ -41,38 +21,6 @@ def create_server():
     fd, server.log_path = tempfile.mkstemp(suffix='.log')
     os.close(fd)
     yield
-
-
-# Common word pool for generating deterministic ~189-word prompts
-COMMON_WORDS = [
-    "the", "be", "to", "of", "and", "a", "in", "that", "have", "I",
-    "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
-    "this", "but", "his", "by", "from", "they", "we", "say", "her", "she",
-    "or", "an", "will", "my", "one", "all", "would", "there", "their", "what",
-    "so", "up", "out", "if", "about", "who", "get", "which", "go", "me",
-    "when", "make", "can", "like", "time", "no", "just", "him", "know", "take",
-    "people", "into", "year", "your", "good", "some", "could", "them", "see", "other",
-    "than", "then", "now", "look", "only", "come", "its", "over", "think", "also",
-    "back", "after", "use", "two", "how", "our", "work", "first", "well", "way",
-    "even", "new", "want", "because", "any", "these", "give", "day", "most", "us",
-    "is", "was", "are", "been", "has", "had", "were", "said", "did", "having",
-    "may", "should", "could", "would", "might", "must", "shall", "can", "will", "am",
-    "find", "give", "tell", "become", "leave", "put", "mean", "keep", "let", "begin",
-    "seem", "help", "talk", "turn", "start", "show", "hear", "play", "run", "move",
-    "live", "believe", "hold", "bring", "happen", "write", "provide", "sit", "stand", "lose",
-    "pay", "meet", "include", "continue", "set", "learn", "change", "lead", "understand", "watch",
-    "follow", "stop", "create", "speak", "read", "allow", "add", "spend", "grow", "open",
-    "walk", "win", "offer", "remember", "love", "consider", "appear", "buy", "wait", "serve",
-    "die", "send", "expect", "build", "stay", "fall", "cut", "reach", "kill", "remain"
-]
-
-
-def make_prompt(seed: int, prefix: str) -> str:
-    """Generate a deterministic ~320-word prompt with unique prefix and seeded word selection.
-    Target: ~840 tokens (measured tokenization rate is ~2.6 tokens/word for repeated common words)."""
-    rng = random.Random(seed)
-    words = [prefix] + rng.choices(COMMON_WORDS, k=319)
-    return " ".join(words)
 
 
 def test_flag_off_matches_baseline_ordering():

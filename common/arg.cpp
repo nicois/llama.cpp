@@ -1745,6 +1745,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_AWARE_SCHED").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-linger-ms"}, "N",
+        "when a slot frees and other requests are queued, hold it briefly (N ms) to serve "
+        "a continuation that arrives during the window ahead of the older backlog. Optimizes "
+        "tool-loop latency by avoiding cache displacement on rapid follow-ups. Only applies "
+        "when the deferred queue is non-empty and the slot holds a non-trivial prompt. "
+        "Suggested range 100-500 ms; values above ~2000 ms turn net-negative. Note that the "
+        "backlog is deferred once per arrival, not once per window: a sustained stream of "
+        "in-window follow-ups can defer an older request indefinitely, whatever N is. "
+        "(default: 0 = disabled)",
+        [](common_params & params, int value) {
+            params.slot_linger_ms = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_LINGER_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

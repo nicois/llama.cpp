@@ -1,5 +1,6 @@
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-sched.h"
 
 #include "log.h"
 
@@ -103,26 +104,22 @@ void server_queue::pop_deferred_task(int id_slot) {
         }
         // rank by resident prefix when cache-aware scheduling is enabled
         if (!found && callback_score_task) {
-            auto   best       = queue_tasks_deferred.end();
-            size_t best_score = 0;
+            // only consider unpinned tasks; pinned tasks are already handled above
+            std::vector<size_t> scores;
+            std::vector<size_t> cands;
 
-            for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
-                // only consider unpinned tasks; pinned tasks are already handled above
-                if (it->id_slot != -1) {
-                    continue;
-                }
-
-                const size_t score = callback_score_task(*it, id_slot);
-
-                // strict > keeps FIFO order among equal scores
-                if (best == queue_tasks_deferred.end() || score > best_score) {
-                    best_score = score;
-                    best       = it;
+            for (size_t i = 0; i < queue_tasks_deferred.size(); i++) {
+                if (queue_tasks_deferred[i].id_slot == -1) {
+                    cands.push_back(i);
+                    scores.push_back(callback_score_task(queue_tasks_deferred[i], id_slot));
                 }
             }
 
-            if (best != queue_tasks_deferred.end()) {
-                QUE_DBG("pop deferred task (score %zu), id_task = %d\n", best_score, best->id);
+            const size_t pick = sched_pick_task(scores);
+            if (pick != SIZE_MAX) {
+                const auto best = queue_tasks_deferred.begin() + cands[pick];
+
+                QUE_DBG("pop deferred task (score %zu), id_task = %d\n", scores[pick], best->id);
                 QUE_DBG("%s", "__TEST_TAG_SCHED_POP_BY_SCORE__\n");
                 queue_tasks.emplace_front(std::move(*best));
                 queue_tasks_deferred.erase(best);
@@ -139,6 +136,72 @@ void server_queue::pop_deferred_task(int id_slot) {
     }
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
+}
+
+void server_queue::pop_deferred_with_linger(int id_slot, int32_t linger_ms, bool should_linger) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+
+    // a task already bound to this slot is the best use of it, waiting only adds latency
+    const bool has_bound_task = std::any_of(queue_tasks_deferred.begin(), queue_tasks_deferred.end(),
+                                            [id_slot](const server_task & task) {
+                                                return task.id_slot == id_slot;
+                                            });
+
+    // Check if we should linger: deferred queue must be non-empty, linger_ms > 0, and should_linger must be true
+    const bool can_linger = !queue_tasks_deferred.empty() && linger_ms > 0 && should_linger && !has_bound_task;
+
+    if (!can_linger) {
+        // No lingering: immediately pop
+        lock.unlock();
+        pop_deferred_task(id_slot);
+        return;
+    }
+
+    // Start lingering: record deadline but don't promote from deferred queue yet
+    // If a fresh arrival finds the idle slot during this window, that's the hit
+    const int64_t now      = ggml_time_ms();
+    const int64_t deadline = now + linger_ms;
+
+    linger_slots[id_slot] = deadline;
+
+    QUE_DBG("slot %d lingering for %d ms (until %" PRId64 ")\n",
+            id_slot, linger_ms, deadline);
+
+    time_last_task = now;
+    condition_tasks.notify_one();
+}
+
+bool server_queue::cancel_linger_if_active(int id_slot) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (linger_slots.erase(id_slot) > 0) {
+        QUE_DBG("slot %d linger cancelled (hit)\n", id_slot);
+        QUE_DBG("%s", "__TEST_TAG_SLOT_LINGER_HIT__\n");
+        return true;
+    }
+    return false;
+}
+
+int64_t server_queue::linger_deadline_min() const {
+    int64_t res = -1;
+    for (const auto & kv : linger_slots) {
+        if (res < 0 || kv.second < res) {
+            res = kv.second;
+        }
+    }
+    return res;
+}
+
+std::vector<int> server_queue::linger_take_expired(int64_t now) {
+    std::vector<int> res;
+    for (auto it = linger_slots.begin(); it != linger_slots.end(); ) {
+        if (now >= it->second) {
+            res.push_back(it->first);
+            it = linger_slots.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return res;
 }
 
 void server_queue::wait_until_no_sleep() {
@@ -348,6 +411,27 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         QUE_DBG("%s", "waiting for new tasks\n");
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
+
+            // Handle lingering expiry: every slot whose deadline passed is still idle, so promote
+            // one deferred task for each. A slot taken during its window was already removed by
+            // cancel_linger_if_active()
+            if (!linger_slots.empty()) {
+                const std::vector<int> expired = linger_take_expired(ggml_time_ms());
+                if (!expired.empty()) {
+                    lock.unlock();
+                    for (const int id_slot : expired) {
+                        QUE_DBG("slot %d linger expired, falling back to FIFO\n", id_slot);
+                        QUE_DBG("%s", "__TEST_TAG_SLOT_LINGER_EXPIRED__\n");
+                        pop_deferred_task(id_slot);
+                    }
+                    lock.lock();
+                    // After popping, we may have a new task to process
+                    if (!queue_tasks.empty()) {
+                        break; // go back to process new tasks
+                    }
+                }
+            }
+
             if (!running || !queue_tasks.empty()) {
                 break; // go back to process new tasks or terminate
             }
@@ -379,14 +463,22 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 condition_tasks.notify_all(); // notify wait_until_no_sleep()
                 break; // process new tasks
             } else {
-                // wait for new tasks or timeout for checking sleeping condition
-                bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
+                // Determine wait timeout: if lingering, wake for the earliest deadline
+                std::chrono::milliseconds wait_time = max_wait_time;
+                const int64_t deadline = linger_deadline_min();
+                if (deadline >= 0) {
+                    const int64_t remaining = std::max<int64_t>(0, deadline - ggml_time_ms());
+                    wait_time = std::chrono::milliseconds(remaining);
+                }
+
+                // wait for new tasks or timeout for checking sleeping condition / linger expiry
+                bool res = condition_tasks.wait_for(lock, wait_time, [&]{
                     return (!queue_tasks.empty() || !running);
                 });
                 if (res) {
                     break; // new task arrived or terminate
                 }
-                // otherwise, loop again to check sleeping condition
+                // otherwise, loop again to check linger expiry / sleeping condition
             }
         }
     }

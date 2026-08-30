@@ -345,30 +345,6 @@ sim_result sim_run(const sim_params & p, bool cache_aware) {
         }
         const size_t need = entry_bytes(p, fresh);
 
-        // demand = argmax candidate for some still-queued session
-        auto has_demand = [&](const server_prompt_cache_state & st) {
-            for (size_t id : queued) {
-                if (id == sid || sessions[id].turn >= p.n_turns) {
-                    continue;
-                }
-                std::vector<llama_token> q_vec = sim_prompt(p, sessions[id], sessions[id].turn);
-                server_tokens q(q_vec, false);
-                const server_prompt_cache_state * best = nullptr;
-                size_t best_lcp = 0;
-                for (const auto & c : states) {
-                    const size_t lcp = c.prompt.tokens.get_common_prefix(q);
-                    if (lcp > best_lcp) {
-                        best_lcp = lcp;
-                        best     = &c;
-                    }
-                }
-                if (best == &st) {
-                    return true;
-                }
-            }
-            return false;
-        };
-
         while (!states.empty() && cache_bytes_used(p, states) + need > p.cache_bytes) {
             states.erase(states.cbegin());
         }
