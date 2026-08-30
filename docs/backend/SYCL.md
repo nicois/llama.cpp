@@ -281,10 +281,20 @@ Upon a successful installation, SYCL is enabled for the available Intel devices,
 
 |Verified release|
 |-|
+|2026.1.2|
 |2025.3.3 |
 |2025.2.1|
 |2025.1|
 |2024.1|
+
+> [!IMPORTANT]
+> **Intel® Deep Learning Essentials** no longer bundles oneDNN as of 2026.1, so it has
+> to be installed separately (package `intel-oneapi-dnnl-devel-2026.0`, or select the
+> component in the installer). Without it `find_package(DNNL)` merely reports
+> `oneDNN not found, disabling oneDNN support` and the build silently loses the oneDNN
+> GEMM and fused-SDPA paths, which are the fast paths on Xe2 *(Battlemage)* and newer.
+> Its lib directory also has to be on `LD_LIBRARY_PATH` at run time, as the image's own
+> environment no longer lists it. See `.devops/intel.Dockerfile` for a worked example.
 
 3. **Verify installation and environment**
 
@@ -800,6 +810,7 @@ User can use the device management in [docs/multi-gpu.md](https://github.com/ggm
 | GGML_SYCL_ENABLE_DNN | 0 or 1 (default)| Enable running computations through oneDNN and always use oneMKL. |
 | GGML_SYCL_FA_ONEDNN | 1 (default) or 0 | Enable the oneDNN fused SDPA (flash-attention) path on supported GPUs. Set to 0 to always use the native SYCL flash-attention kernel. |
 | GGML_SYCL_FA_ONEDNN_MAX_KV | 0 (default, disabled) or positive integer | By default (0), all sequences are handled by the oneDNN fused SDPA path, regardless of KV length; a positive value caps that length, past which sequences fall back to the native kernel. If GPU driver watchdog resets (DEVICE_LOST) occur during long-context inference, set this near the context depth where they start, e.g. 24576. |
+| GGML_SYCL_FA_TILE_QUANT | unset (default), 0 or 1 | Force which flash-attention kernel token generation uses with a quantized KV cache. Left unset, TILE is chosen only on a Battlemage GPU whose runtime reports matrix support, and only when llama.cpp was built with oneAPI 2026.1 or newer; every other combination keeps using VEC. TILE is substantially faster there (+42.8% at 32k, +64.7% at 65k, +85.3% at 118k), but on oneAPI 2025.3 that path crashes at hsk=256, hence the gate. Set to 1 to force TILE or 0 to force VEC, for A/B measurement. The resolved choice is logged once per device at load time. |
 | GGML_SYCL_ENABLE_VMM | 0 or 1 (default) | Enable the virtual-memory device pool. |
 | GGML_SYCL_ENABLE_MKL_FA | 1 (default) or 0 | Enable oneMKL GEMM flash attention for XMX-accelerated prompt processing with quantized KV cache. Automatically activates during prefill (prompt processing) when all conditions are met: (1) flash-attn enabled (`-fa` or `--flash-attn on`), (2) KV cache quantized (`--cache-type-k q8_0 --cache-type-v q8_0` or other `*_0/*_1` types), (3) batch size ≥ 1024 (`--batch-size 1024`), (4) prompt length ≥ 1024 tokens. Set to 0 to force the TILE kernel for A/B testing. Example minimum command: `llama-cli -m model.gguf -fa -ngl 99 --cache-type-k q8_0 --cache-type-v q8_0 --batch-size 1024 -p "your prompt"` |
 | GGML_SYCL_MKL_FA_DEBUG | 0 (default) or 1 | Enable per-call diagnostic logging for MKL flash attention: GEMM/softmax timings, interleaved-head detection, and buffer memory usage. |
