@@ -9992,6 +9992,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1},  512, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(64,  64,  4, {1, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
 
+    // Quantized KV cache at head size 128, in generation-shaped batches.
+    //
+    // The sweep above only exercises quantized K/V at hsk 64 and 72 (see the type_KV
+    // filter), yet 128 is the head size essentially every current GQA model uses, and
+    // token generation is where backends specialize the attention kernel most (e.g. the
+    // SYCL TILE kernel reads the cache natively there instead of converting it to F16).
+    // Both nr23 values are needed: {4,1} and {1,1} select different kernel shapes.
+    // kv is deliberately not always a multiple of FATTN_KQ_STRIDE, to cover the
+    // out-of-bounds tails.
+    for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int nb : { 1, 2, 3 }) {
+            for (int kv : { 512, 1024, 300 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(
+                            128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                test_cases.emplace_back(new test_flash_attn_ext(
+                            128, 128, 4, {1, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+    }
+
     // large-KV F16 cases (Qwen3.6-27B geometry and a llama-class control): the upstream matrix
     // stops at kv=1024, blind to long-context FA bugs (e.g. the oneDNN SDPA ordering race on BMG).
     for (int64_t kv : { 4096, 16384 }) {
