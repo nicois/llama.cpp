@@ -103,6 +103,55 @@ enum best_fattn_kernel {
 };
 
 
+// Whether quantized-KV decode should go to TILE instead of VEC.
+//
+// TILE is much faster there on Xe2 (Battlemage): +42.8% at 32k, +64.7% at 65k and
+// +85.3% at 118k (#26689).  Those numbers were measured on a oneAPI 2026.1 toolchain
+// and runtime, and 2026.1 is also where FLASH_ATTN_EXT passes the full backend-ops
+// suite on Battlemage -- on 2025.3 hsk=256 crashes on this path and the device reports
+// no matrix support at all.  So require a 2026.1-or-newer build *and* a runtime that
+// exposes matrix support on the device, which is the observable difference between the
+// two driver stacks; everything else keeps the previous VEC behaviour unchanged.
+//
+// GGML_SYCL_FA_TILE_QUANT=0/1 forces the choice, for measuring either side.
+static bool ggml_sycl_fa_tile_for_quantized_kv(const int device) {
+    static const int force = ggml_sycl_get_env("GGML_SYCL_FA_TILE_QUANT", -1);
+
+    // Decided once per device, and logged, since which kernel decode ends up on is
+    // otherwise invisible and is worth several tens of percent.
+    static int8_t cached[GGML_SYCL_MAX_DEVICES] = {};   // 0 = undecided, 1 = TILE, 2 = VEC
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    if (cached[device]) {
+        return cached[device] == 1;
+    }
+
+    bool         use_tile;
+    const char * why;
+    if (force >= 0) {
+        use_tile = force != 0;
+        why      = "forced by GGML_SYCL_FA_TILE_QUANT";
+    } else {
+#if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260100
+        const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
+        const bool     bmg  = arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31;
+        use_tile            = bmg && ggml_sycl_info().devices[device].has_matrix;
+        why                 = !bmg     ? "untested on this arch"
+                              : use_tile ? "Battlemage, matrix support reported"
+                                         : "runtime reports no matrix support";
+#else
+        use_tile = false;
+        why      = "built with a pre-2026.1 oneAPI toolchain";
+#endif
+    }
+
+    GGML_LOG_INFO("%s: SYCL%d quantized-KV decode uses the %s kernel (%s)\n", __func__, device,
+                  use_tile ? "TILE" : "VEC", why);
+    cached[device] = use_tile ? 1 : 2;
+    return use_tile;
+}
+
 static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef SYCL_FLASH_ATTN
     GGML_UNUSED(dst);
@@ -262,9 +311,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
             }
         } else {
             if (Q->ne[1] <= 2) {
-                // TILE is faster for quantized KV decode on Xe2 (BMG); keep VEC on untested archs
-                const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
-                if (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31) {
+                if (ggml_sycl_fa_tile_for_quantized_kv(device)) {
                     return BEST_FATTN_KERNEL_TILE;
                 }
                 return BEST_FATTN_KERNEL_VEC;

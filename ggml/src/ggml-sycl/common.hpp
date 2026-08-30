@@ -243,6 +243,7 @@ struct sycl_device_info {
     bool    l0_discrete_gpu;    // Level Zero backend and not an integrated GPU
     size_t  vmm_granularity;    // granularity of virtual memory
     size_t  total_vram;
+    bool    has_matrix;         // sycl::aspect::ext_intel_matrix, i.e. XMX exposed by this runtime
     sycl_hw_info hw_info;
     optimize_feature opt_feature;
     bool    usm_system_support; // support for USM system allocations
