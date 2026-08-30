@@ -44,6 +44,7 @@
 /tags
 /.build/
 /build*
+/.worktrees/
 /release
 /debug
 /libllama.so
