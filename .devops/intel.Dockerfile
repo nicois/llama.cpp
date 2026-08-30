@@ -1,4 +1,12 @@
-ARG ONEAPI_VERSION=2025.3.3-0-devel-ubuntu24.04
+ARG ONEAPI_VERSION=2026.1.2-devel-ubuntu24.04
+
+# oneDNN is no longer bundled in the Deep Learning Essentials image as of 2026.1, so
+# it is installed explicitly below.  Without it find_package(DNNL) merely emits a
+# STATUS message and the build silently loses the oneDNN GEMM and flash-attention
+# paths, which are the fast paths on Xe2 (Battlemage) and later.  2026.0.2 is the
+# newest oneDNN in the oneAPI apt repo and depends on the 2026.1 DPC++ runtime.
+ARG ONEDNN_VERSION=2026.0
+
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
@@ -24,13 +32,19 @@ FROM docker.io/intel/deep-learning-essentials:$ONEAPI_VERSION AS build
 ARG GGML_SYCL_F16=ON
 ARG LEVEL_ZERO_VERSION=1.28.2
 ARG LEVEL_ZERO_UBUNTU_VERSION=u24.04
+ARG ONEDNN_VERSION
 RUN apt-get update && \
-    apt-get install -y git libssl-dev wget ca-certificates && \
+    apt-get install -y git libssl-dev wget ca-certificates \
+        intel-oneapi-dnnl-devel-${ONEDNN_VERSION} && \
     cd /tmp && \
     wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero.deb && \
     wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero-devel_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero-devel.deb && \
     apt-get -o Dpkg::Options::="--force-overwrite" install -y ./level-zero.deb ./level-zero-devel.deb && \
     rm -f /tmp/level-zero.deb /tmp/level-zero-devel.deb
+
+# The image sets CMAKE_PREFIX_PATH for the components it ships; oneDNN is not one of
+# them any more, so add it back the same way find_package(DNNL) used to find it.
+ENV CMAKE_PREFIX_PATH="/opt/intel/oneapi/dnnl/${ONEDNN_VERSION}/lib/cmake:${CMAKE_PREFIX_PATH}"
 
 WORKDIR /app
 
@@ -43,6 +57,8 @@ RUN if [ "${GGML_SYCL_F16}" = "ON" ]; then \
         && export OPT_SYCL_F16="-DGGML_SYCL_F16=ON" \
         && export SYCL_PROGRAM_COMPILE_OPTIONS="-cl-fp32-correctly-rounded-divide-sqrt"; \
     fi && \
+    test -f "/opt/intel/oneapi/dnnl/${ONEDNN_VERSION}/lib/cmake/dnnl/dnnl-config.cmake" \
+        || { echo "oneDNN not found; the build would silently disable it" >&2; exit 1; } && \
     echo "Building with dynamic libs" && \
     cmake -B build -DGGML_NATIVE=OFF -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${OPT_SYCL_F16} && \
     cmake --build build --config Release -j$(nproc)
@@ -64,6 +80,7 @@ FROM docker.io/intel/deep-learning-essentials:$ONEAPI_VERSION AS base
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
+ARG ONEDNN_VERSION
 ARG IMAGE_URL=https://github.com/ggml-org/llama.cpp
 ARG IMAGE_SOURCE=https://github.com/ggml-org/llama.cpp
 LABEL org.opencontainers.image.created=$BUILD_DATE \
@@ -101,13 +118,18 @@ RUN mkdir /tmp/neo/ && cd /tmp/neo/ \
   && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.deb \
   && dpkg --install *.deb
 
+# libggml-sycl.so links libdnnl.so, which the image no longer ships (see the
+# ONEDNN_VERSION comment at the top), and whose lib directory is therefore missing
+# from the image's LD_LIBRARY_PATH.
 RUN apt-get update \
-    && apt-get install -y libgomp1 curl ffmpeg \
+    && apt-get install -y libgomp1 curl ffmpeg intel-oneapi-dnnl-${ONEDNN_VERSION} \
     && apt autoremove -y \
     && apt clean -y \
     && rm -rf /tmp/* /var/tmp/* \
     && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
     && find /var/cache -type f -delete
+
+ENV LD_LIBRARY_PATH="/opt/intel/oneapi/dnnl/${ONEDNN_VERSION}/lib:${LD_LIBRARY_PATH}"
 
 ### Full
 FROM base AS full
