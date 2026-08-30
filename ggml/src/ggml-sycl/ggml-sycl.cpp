@@ -90,6 +90,24 @@
 static bool g_sycl_loaded = false;
 int g_ggml_sycl_debug = 0;
 int g_ggml_sycl_enable_optimize = 1;
+// Skip the weight reorder for tensors larger than this many MiB. The reorder stages a
+// full-size copy of the tensor (see sycl_reorder_temp_buffer), and that scratch is not
+// visible to llama.cpp's memory breakdown, so on a nearly-full device the largest tensor
+// (typically output.weight, ~1 GiB for a 27B) can be the difference between loading and
+// not. 0 = no limit, preserving the previous behaviour.
+int g_ggml_sycl_reorder_max_mib = 0;
+// Where to stage the weight reorder. The staging buffer is ephemeral -- written once by
+// a device->host copy and read exactly once by the reorder kernel, whose output goes to
+// the real device tensor -- so host memory costs one extra PCIe traversal at load
+// (~100 ms for a 1 GiB tensor) and leaves the VRAM free. Inference is unaffected.
+//   0 (default) decide from free device memory: use VRAM only where there is headroom to
+//              spare, so the reorder never consumes margin reserved for flash-attention
+//              staging or the KV cache
+//   1          always stage in host memory, whatever the size (used by tests)
+//   >1         always stage tensors at least this many MiB in host memory
+//   <0         never stage in host memory (previous behaviour: device, with host used
+//              only if the device allocation outright fails)
+int g_ggml_sycl_reorder_host_mib = 0;
 int g_ggml_sycl_enable_graph = 0;
 int g_ggml_sycl_enable_dnn = 1;
 int g_ggml_sycl_fa_onednn = 1;
@@ -309,6 +327,8 @@ static void ggml_check_sycl() try {
     if (!initialized) {
         g_ggml_sycl_debug = ggml_sycl_get_env("GGML_SYCL_DEBUG", 0);
         g_ggml_sycl_enable_optimize = ggml_sycl_get_env("GGML_SYCL_ENABLE_OPT", 1);
+        g_ggml_sycl_reorder_max_mib = ggml_sycl_get_env("GGML_SYCL_REORDER_MAX_MIB", 0);
+        g_ggml_sycl_reorder_host_mib = ggml_sycl_get_env("GGML_SYCL_REORDER_HOST_MIB", 0);
         g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
@@ -407,6 +427,8 @@ static void ggml_check_sycl() try {
 #endif
 
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_OPT: %d\n", g_ggml_sycl_enable_optimize);
+        GGML_LOG_INFO("  GGML_SYCL_REORDER_MAX_MIB: %d\n", g_ggml_sycl_reorder_max_mib);
+        GGML_LOG_INFO("  GGML_SYCL_REORDER_HOST_MIB: %d\n", g_ggml_sycl_reorder_host_mib);
 
 #if defined(GGML_SYCL_SUPPORT_VMM)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
@@ -4038,11 +4060,67 @@ static inline void sycl_ext_free(dpct::queue_ptr stream, void * ptr) {
 // When device allocation fails and GGML_SYCL_HOST_MEM_FALLBACK is enabled,
 // falls back to host memory so the reorder kernel can still run (over PCIe).
 // Device access to host memory requires Linux kernel 6.8+ (Ubuntu 26.04+).
+// Should this ephemeral staging buffer live in host memory rather than VRAM?
+//
+// Reacting only to an outright device allocation failure is too late: the reorder will
+// happily take the last of the device memory, including margin the fitter reserved for
+// flash-attention staging at depth, and the OOM then lands mid-prefill instead. So check
+// for headroom up front and decline VRAM we do not comfortably have.
+static bool reorder_stage_on_host(size_t size) {
+#ifndef GGML_SYCL_HOST_MEM_FALLBACK
+    GGML_UNUSED(size);
+    return false;
+#else
+    if (g_ggml_sycl_reorder_host_mib < 0) {
+        return false;   // explicitly disabled
+    }
+    if (g_ggml_sycl_reorder_host_mib == 1) {
+        // 1 = always host, whatever the size. Mainly so the host path is reachable in
+        // tests (test-backend-ops tensors are far below any MiB-scale threshold), but
+        // also usable on a device with very little free memory.
+        return true;
+    }
+    if (g_ggml_sycl_reorder_host_mib > 1) {
+        return size >= (size_t) g_ggml_sycl_reorder_host_mib * 1024 * 1024;
+    }
+
+    size_t free_b = 0, total_b = 0;
+    ggml_backend_sycl_get_device_memory(ggml_sycl_get_device(), &free_b, &total_b);
+
+    // free == total means the free-memory query is unavailable (it needs
+    // ZES_ENABLE_SYSMAN=1). With no reliable reading, keep the previous behaviour.
+    if (free_b == 0 || total_b == 0 || free_b >= total_b) {
+        return false;
+    }
+
+    const size_t headroom = std::max<size_t>((size_t) 256 << 20, total_b / 20);
+    const bool   on_host  = free_b < size + headroom;
+    if (on_host) {
+        GGML_LOG_INFO("%s: staging %zu MiB reorder buffer in host memory "
+                      "(%zu MiB free, wanted %zu MiB incl. headroom)\n",
+                      __func__, size / 1024 / 1024, free_b / 1024 / 1024,
+                      (size + headroom) / 1024 / 1024);
+    }
+    return on_host;
+#endif
+}
+
 struct sycl_reorder_temp_buffer {
     void *          ptr  = nullptr;
     dpct::queue_ptr stream;
 
     sycl_reorder_temp_buffer(dpct::queue_ptr stream, size_t size) : stream(stream) {
+#ifdef GGML_SYCL_HOST_MEM_FALLBACK
+        if (reorder_stage_on_host(size)) {
+            ptr = sycl::malloc_host(size, *stream);
+            if (ptr) {
+                host_fallback = true;
+                return;
+            }
+            GGML_LOG_WARN("%s: host alloc of %zu bytes failed, trying device\n",
+                          __func__, size);
+        }
+#endif
         ptr = sycl_ext_malloc_device(stream, size);
 #ifdef GGML_SYCL_HOST_MEM_FALLBACK
         if (!ptr) {
@@ -4060,6 +4138,12 @@ struct sycl_reorder_temp_buffer {
             return;
         }
         if (host_fallback) {
+            // sycl::free() on a host allocation takes effect immediately, unlike the
+            // queue-ordered async_free() used for device memory. The reorder kernel
+            // reads this buffer and is not waited on when async memory ops are enabled
+            // (the default), so freeing here without synchronising is a use-after-free
+            // that silently corrupts the reordered weights.
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
             sycl::free(ptr, *stream);
         } else {
             sycl_ext_free(stream, ptr);
@@ -4582,9 +4666,24 @@ static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_ten
            dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
 }
 
+// The reorder stages a full-size copy of the tensor, so peak scratch is the largest reordered
+// tensor. Declining is safe -- it is the same path taken when that allocation fails.
+static bool reorder_scratch_within_budget(const ggml_tensor * src0) {
+    if (g_ggml_sycl_reorder_max_mib <= 0) {
+        return true;
+    }
+    const size_t bytes = ggml_nbytes(src0);
+    if (bytes <= (size_t) g_ggml_sycl_reorder_max_mib * 1024 * 1024) {
+        return true;
+    }
+    GGML_SYCL_DEBUG("[SYCL] skipping reorder of %s: %zu MiB exceeds GGML_SYCL_REORDER_MAX_MIB=%d\n",
+                    src0->name, bytes / 1024 / 1024, g_ggml_sycl_reorder_max_mib);
+    return false;
+}
+
 static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                             ggml_tensor * dst, mul_mat_algo mm_algorithm) {
-    if (!should_reorder_tensor(*ctx, dst)) {
+    if (!should_reorder_tensor(*ctx, dst) || !reorder_scratch_within_budget(src0)) {
         return;
     }
 
@@ -4622,6 +4721,9 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
         return;
     }
     if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K) {
+        return;
+    }
+    if (!reorder_scratch_within_budget(src0)) {
         return;
     }
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
